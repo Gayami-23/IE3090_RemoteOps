@@ -7,7 +7,7 @@
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 9410
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 
 int main(void)
 {
@@ -61,7 +61,8 @@ int main(void)
 
     printf("Connected to RemoteOps Agent.\n");
 
-    /* Ask user for authentication token */
+    /* ---------- AUTHENTICATION ---------- */
+
     printf("Enter authentication token: ");
 
     if (scanf("%99s", token) != 1)
@@ -71,13 +72,11 @@ int main(void)
         return 1;
     }
 
-    /* Create AUTH command */
     snprintf(command,
              sizeof(command),
              "AUTH %s\n",
              token);
 
-    /* Send AUTH command */
     if (send(sock_fd,
              command,
              strlen(command),
@@ -88,13 +87,13 @@ int main(void)
         return 1;
     }
 
-    /* Receive Agent response */
     memset(buffer, 0, sizeof(buffer));
 
-    bytes_received = recv(sock_fd,
-                          buffer,
-                          sizeof(buffer) - 1,
-                          0);
+    bytes_received =
+        recv(sock_fd,
+             buffer,
+             sizeof(buffer) - 1,
+             0);
 
     if (bytes_received <= 0)
     {
@@ -106,6 +105,65 @@ int main(void)
     buffer[bytes_received] = '\0';
 
     printf("Agent response: %s", buffer);
+
+    /* Stop if authentication failed */
+    if (strstr(buffer, "OK AUTHENTICATED") == NULL)
+    {
+        printf("Authentication failed. Closing connection.\n");
+        close(sock_fd);
+        return 1;
+    }
+
+    /* ---------- COMMAND LOOP ---------- */
+
+    while (1)
+    {
+        printf("\nEnter command (SYSINFO or QUIT): ");
+
+        if (scanf("%149s", command) != 1)
+        {
+            break;
+        }
+
+        char send_buffer[200];
+
+        snprintf(send_buffer,
+                 sizeof(send_buffer),
+                 "%s\n",
+                 command);
+
+        if (send(sock_fd,
+                 send_buffer,
+                 strlen(send_buffer),
+                 0) < 0)
+        {
+            perror("send");
+            break;
+        }
+
+        memset(buffer, 0, sizeof(buffer));
+
+        bytes_received =
+            recv(sock_fd,
+                 buffer,
+                 sizeof(buffer) - 1,
+                 0);
+
+        if (bytes_received <= 0)
+        {
+            printf("Agent closed the connection.\n");
+            break;
+        }
+
+        buffer[bytes_received] = '\0';
+
+        printf("\nAgent response:\n%s", buffer);
+
+        if (strcmp(command, "QUIT") == 0)
+        {
+            break;
+        }
+    }
 
     close(sock_fd);
 
