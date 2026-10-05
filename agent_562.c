@@ -10,12 +10,14 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-1562"
 #define SID "2651"
 #define BUFFER_SIZE 4096
 #define STORAGE_DIR "./agentfiles/IT24101562"
+#define LOG_FILE "remoteops_IT24101562.log"
 #define MONITOR_INTERVAL 2
 
 /* =========================================================
@@ -37,6 +39,61 @@ typedef struct
     pthread_t thread;
     pthread_mutex_t lock;
 } MonitorInfo;
+
+/* =========================================================
+   GLOBAL LOG MUTEX
+
+   Multiple Controller threads may write to the log file.
+   This mutex prevents their log entries from overlapping.
+   ========================================================= */
+
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* =========================================================
+   LOGGING FUNCTION
+   ========================================================= */
+
+void write_log(const char *client_ip,
+               const char *event)
+{
+    time_t current_time;
+    struct tm time_info;
+    char timestamp[64];
+
+    time(&current_time);
+
+    localtime_r(&current_time,
+                &time_info);
+
+    strftime(timestamp,
+             sizeof(timestamp),
+             "%Y-%m-%d %H:%M:%S",
+             &time_info);
+
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *log_file =
+        fopen(LOG_FILE, "a");
+
+    if (log_file != NULL)
+    {
+        fprintf(log_file,
+                "%s | %s | %s | SID:%s\n",
+                timestamp,
+                client_ip,
+                event,
+                SID);
+
+        fflush(log_file);
+        fclose(log_file);
+    }
+    else
+    {
+        perror("Unable to open log file");
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
 
 /* =========================================================
    TCP HELPER FUNCTIONS
@@ -202,8 +259,7 @@ int recv_exact_to_file(
         }
 
         remaining -=
-            (unsigned long long)
-                received;
+            (unsigned long long)received;
     }
 
     return 0;
@@ -245,8 +301,7 @@ int send_file_bytes(
         }
 
         remaining -=
-            (unsigned long long)
-                bytes_read;
+            (unsigned long long)bytes_read;
     }
 
     return 0;
@@ -391,31 +446,26 @@ void execute_whitelist_command(
     {
         shell_command = "date";
     }
-
     else if (strcmp(name,
                     "UPTIME") == 0)
     {
         shell_command = "uptime";
     }
-
     else if (strcmp(name,
                     "DISKFREE") == 0)
     {
         shell_command = "df -h";
     }
-
     else if (strcmp(name,
                     "HOSTNAME") == 0)
     {
         shell_command = "hostname";
     }
-
     else if (strcmp(name,
                     "WHOAMI") == 0)
     {
         shell_command = "whoami";
     }
-
     else
     {
         send_text(
@@ -607,8 +657,9 @@ void handle_put(
    GET
    ========================================================= */
 
-void handle_get(int client_fd,
-                const char *filename)
+void handle_get(
+    int client_fd,
+    const char *filename)
 {
     char filepath[1024];
     char response[1024];
@@ -767,22 +818,19 @@ void *monitor_thread_function(
 
         if (sysinfo(&info) == 0)
         {
-            unsigned long
-                total_ram_mb =
-                    info.totalram *
-                    info.mem_unit /
-                    (1024 * 1024);
+            unsigned long total_ram_mb =
+                info.totalram *
+                info.mem_unit /
+                (1024 * 1024);
 
-            unsigned long
-                free_ram_mb =
-                    info.freeram *
-                    info.mem_unit /
-                    (1024 * 1024);
+            unsigned long free_ram_mb =
+                info.freeram *
+                info.mem_unit /
+                (1024 * 1024);
 
-            unsigned long
-                used_ram_mb =
-                    total_ram_mb -
-                    free_ram_mb;
+            unsigned long used_ram_mb =
+                total_ram_mb -
+                free_ram_mb;
 
             double cpu_load =
                 (double)info.loads[0] /
@@ -881,8 +929,7 @@ int start_monitoring(
 
     snprintf(
         monitor->controller_ip,
-        sizeof(
-            monitor->controller_ip),
+        sizeof(monitor->controller_ip),
         "%s",
         controller_ip);
 
@@ -1014,6 +1061,10 @@ void *handle_client(void *arg)
         "Controller connected from %s\n",
         controller_ip);
 
+    write_log(
+        controller_ip,
+        "CONNECTED");
+
     MonitorInfo monitor;
 
     memset(&monitor,
@@ -1042,6 +1093,10 @@ void *handle_client(void *arg)
             "Controller %s disconnected before authentication.\n",
             controller_ip);
 
+        write_log(
+            controller_ip,
+            "DISCONNECTED BEFORE AUTHENTICATION");
+
         close(client_fd);
 
         pthread_mutex_destroy(
@@ -1055,6 +1110,11 @@ void *handle_client(void *arg)
         controller_ip,
         buffer);
 
+    /*
+     * Do not write the authentication token to
+     * the log file.
+     */
+
     if (strcmp(
             buffer,
             "AUTH " AUTH_TOKEN) != 0)
@@ -1067,6 +1127,10 @@ void *handle_client(void *arg)
         printf(
             "[%s] Authentication failed.\n",
             controller_ip);
+
+        write_log(
+            controller_ip,
+            "AUTH FAILED");
 
         close(client_fd);
 
@@ -1085,8 +1149,12 @@ void *handle_client(void *arg)
         "[%s] Authentication successful.\n",
         controller_ip);
 
+    write_log(
+        controller_ip,
+        "AUTH SUCCESS");
+
     /* =====================================================
-       COMMAND LOOP FOR THIS CONTROLLER
+       COMMAND LOOP
        ===================================================== */
 
     while (1)
@@ -1103,6 +1171,10 @@ void *handle_client(void *arg)
                 "[%s] Controller disconnected.\n",
                 controller_ip);
 
+            write_log(
+                controller_ip,
+                "DISCONNECTED");
+
             stop_monitoring_disconnect(
                 &monitor);
 
@@ -1113,6 +1185,23 @@ void *handle_client(void *arg)
             "[%s] Received: %s\n",
             controller_ip,
             buffer);
+
+        /*
+         * Authentication is already complete,
+         * therefore commands can safely be logged.
+         */
+        char log_event[
+            BUFFER_SIZE + 32];
+
+        snprintf(
+            log_event,
+            sizeof(log_event),
+            "COMMAND %s",
+            buffer);
+
+        write_log(
+            controller_ip,
+            log_event);
 
         /* ---------------- SYSINFO ---------------- */
 
@@ -1279,10 +1368,14 @@ void *handle_client(void *arg)
                 "[%s] Controller requested disconnect.\n",
                 controller_ip);
 
+            write_log(
+                controller_ip,
+                "GRACEFUL DISCONNECT");
+
             break;
         }
 
-        /* ---------------- UNKNOWN ---------------- */
+        /* ---------------- UNKNOWN COMMAND ---------------- */
 
         else
         {
@@ -1290,6 +1383,10 @@ void *handle_client(void *arg)
                 client_fd,
                 "ERR 002 UNKNOWN_COMMAND SID:"
                 SID "\n");
+
+            write_log(
+                controller_ip,
+                "UNKNOWN COMMAND");
         }
     }
 
@@ -1317,8 +1414,8 @@ int main(void)
         server_addr;
 
     /*
-     * Prevent the Agent from terminating if it
-     * sends to a Controller that disconnected.
+     * Prevent Agent termination when attempting
+     * to send to a disconnected Controller.
      */
     signal(SIGPIPE,
            SIG_IGN);
@@ -1379,13 +1476,9 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /*
-     * Backlog is larger than five so the server
-     * can comfortably accept at least five
-     * simultaneous Controllers.
-     */
-    if (listen(server_fd,
-               10) < 0)
+    if (listen(
+            server_fd,
+            10) < 0)
     {
         perror("listen");
 
@@ -1405,12 +1498,20 @@ int main(void)
         "Concurrent Controller support enabled.\n");
 
     printf(
+        "Logging to %s\n",
+        LOG_FILE);
+
+    printf(
         "Waiting for Controller connections...\n");
 
-    /*
-     * Keep accepting Controllers.
-     * Each accepted Controller gets its own thread.
-     */
+    write_log(
+        "AGENT",
+        "AGENT STARTED");
+
+    /* =====================================================
+       ACCEPT CONTROLLERS CONTINUOUSLY
+       ===================================================== */
+
     while (1)
     {
         struct sockaddr_in
@@ -1434,6 +1535,7 @@ int main(void)
             }
 
             perror("accept");
+
             continue;
         }
 
@@ -1476,15 +1578,14 @@ int main(void)
             continue;
         }
 
-        /*
-         * Detached threads clean themselves up
-         * when the Controller disconnects.
-         */
         pthread_detach(
             client_thread);
     }
 
     close(server_fd);
+
+    pthread_mutex_destroy(
+        &log_mutex);
 
     return 0;
 }
