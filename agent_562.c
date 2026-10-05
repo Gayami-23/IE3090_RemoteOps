@@ -54,6 +54,57 @@ void send_sysinfo(int client_fd)
     send(client_fd, response, strlen(response), 0);
 }
 
+/* Send running process information to the Controller */
+void send_listproc(int client_fd)
+{
+    FILE *fp;
+    char line[512];
+
+    /* Execute ps command and read its output */
+    fp = popen("ps -eo pid,comm --no-headers", "r");
+
+    if (fp == NULL)
+    {
+        const char *error =
+            "ERR 003 LISTPROC_FAILED SID:" SID "\n";
+
+        send(client_fd,
+             error,
+             strlen(error),
+             0);
+
+        return;
+    }
+
+    /* Send table heading */
+    const char *header = "PID COMMAND\n";
+
+    send(client_fd,
+         header,
+         strlen(header),
+         0);
+
+    /* Send each process to the Controller */
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        send(client_fd,
+             line,
+             strlen(line),
+             0);
+    }
+
+    pclose(fp);
+
+    /* Tell Controller that LISTPROC is complete */
+    const char *end =
+        "OK LISTPROC SID:" SID "\n";
+
+    send(client_fd,
+         end,
+         strlen(end),
+         0);
+}
+
 int main(void)
 {
     int server_fd;
@@ -67,6 +118,7 @@ int main(void)
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
 
+    /* Create TCP socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (server_fd < 0)
@@ -75,20 +127,28 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
+    /* Allow port reuse */
     int opt = 1;
 
-    setsockopt(server_fd,
-               SOL_SOCKET,
-               SO_REUSEADDR,
-               &opt,
-               sizeof(opt));
+    if (setsockopt(server_fd,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &opt,
+                   sizeof(opt)) < 0)
+    {
+        perror("setsockopt");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
 
+    /* Configure Agent address */
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
+    /* Bind socket */
     if (bind(server_fd,
              (struct sockaddr *)&server_addr,
              sizeof(server_addr)) < 0)
@@ -98,6 +158,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
+    /* Listen for Controller connections */
     if (listen(server_fd, 5) < 0)
     {
         perror("listen");
@@ -109,6 +170,7 @@ int main(void)
     printf("Agent listening on TCP port %d...\n", PORT);
     printf("Waiting for a Controller connection...\n");
 
+    /* Accept Controller */
     client_fd = accept(server_fd,
                        (struct sockaddr *)&client_addr,
                        &client_len);
@@ -123,26 +185,36 @@ int main(void)
     printf("Controller connected from %s\n",
            inet_ntoa(client_addr.sin_addr));
 
-    /* ---------- AUTHENTICATION ---------- */
+    /* ===================================== */
+    /* AUTHENTICATION                        */
+    /* ===================================== */
 
     memset(buffer, 0, sizeof(buffer));
 
     bytes_received =
-        recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        recv(client_fd,
+             buffer,
+             sizeof(buffer) - 1,
+             0);
 
     if (bytes_received <= 0)
     {
         printf("Controller disconnected.\n");
+
         close(client_fd);
         close(server_fd);
+
         return 0;
     }
 
     buffer[bytes_received] = '\0';
+
+    /* Remove newline */
     buffer[strcspn(buffer, "\r\n")] = '\0';
 
     printf("Received command: %s\n", buffer);
 
+    /* Check authentication token */
     if (strcmp(buffer, "AUTH " AUTH_TOKEN) != 0)
     {
         const char *response =
@@ -161,6 +233,7 @@ int main(void)
         return 0;
     }
 
+    /* Authentication successful */
     const char *auth_response =
         "OK AUTHENTICATED SID:" SID "\n";
 
@@ -171,7 +244,9 @@ int main(void)
 
     printf("Authentication successful.\n");
 
-    /* ---------- COMMAND LOOP ---------- */
+    /* ===================================== */
+    /* COMMAND LOOP                          */
+    /* ===================================== */
 
     while (1)
     {
@@ -190,14 +265,25 @@ int main(void)
         }
 
         buffer[bytes_received] = '\0';
+
+        /* Remove newline */
         buffer[strcspn(buffer, "\r\n")] = '\0';
 
         printf("Received command: %s\n", buffer);
 
+        /* SYSINFO command */
         if (strcmp(buffer, "SYSINFO") == 0)
         {
             send_sysinfo(client_fd);
         }
+
+        /* LISTPROC command */
+        else if (strcmp(buffer, "LISTPROC") == 0)
+        {
+            send_listproc(client_fd);
+        }
+
+        /* QUIT command */
         else if (strcmp(buffer, "QUIT") == 0)
         {
             const char *response =
@@ -209,8 +295,11 @@ int main(void)
                  0);
 
             printf("Controller requested disconnect.\n");
+
             break;
         }
+
+        /* Unknown command */
         else
         {
             const char *response =
@@ -223,6 +312,7 @@ int main(void)
         }
     }
 
+    /* Close sockets */
     close(client_fd);
     close(server_fd);
 

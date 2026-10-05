@@ -61,7 +61,9 @@ int main(void)
 
     printf("Connected to RemoteOps Agent.\n");
 
-    /* ---------- AUTHENTICATION ---------- */
+    /* ===================================== */
+    /* AUTHENTICATION                        */
+    /* ===================================== */
 
     printf("Enter authentication token: ");
 
@@ -106,7 +108,7 @@ int main(void)
 
     printf("Agent response: %s", buffer);
 
-    /* Stop if authentication failed */
+    /* Check authentication */
     if (strstr(buffer, "OK AUTHENTICATED") == NULL)
     {
         printf("Authentication failed. Closing connection.\n");
@@ -114,11 +116,14 @@ int main(void)
         return 1;
     }
 
-    /* ---------- COMMAND LOOP ---------- */
+    /* ===================================== */
+    /* COMMAND LOOP                          */
+    /* ===================================== */
 
     while (1)
     {
-        printf("\nEnter command (SYSINFO or QUIT): ");
+        printf("\nEnter command "
+               "(SYSINFO, LISTPROC or QUIT): ");
 
         if (scanf("%149s", command) != 1)
         {
@@ -132,6 +137,7 @@ int main(void)
                  "%s\n",
                  command);
 
+        /* Send command to Agent */
         if (send(sock_fd,
                  send_buffer,
                  strlen(send_buffer),
@@ -141,23 +147,60 @@ int main(void)
             break;
         }
 
-        memset(buffer, 0, sizeof(buffer));
-
-        bytes_received =
-            recv(sock_fd,
-                 buffer,
-                 sizeof(buffer) - 1,
-                 0);
-
-        if (bytes_received <= 0)
+        /*
+         * LISTPROC can contain many lines.
+         * Keep receiving until the final
+         * OK LISTPROC response is received.
+         */
+        if (strcmp(command, "LISTPROC") == 0)
         {
-            printf("Agent closed the connection.\n");
-            break;
+            while (1)
+            {
+                memset(buffer, 0, sizeof(buffer));
+
+                bytes_received =
+                    recv(sock_fd,
+                         buffer,
+                         sizeof(buffer) - 1,
+                         0);
+
+                if (bytes_received <= 0)
+                {
+                    printf("Agent closed the connection.\n");
+                    break;
+                }
+
+                buffer[bytes_received] = '\0';
+
+                printf("%s", buffer);
+
+                if (strstr(buffer,
+                           "OK LISTPROC SID:2651") != NULL)
+                {
+                    break;
+                }
+            }
         }
+        else
+        {
+            memset(buffer, 0, sizeof(buffer));
 
-        buffer[bytes_received] = '\0';
+            bytes_received =
+                recv(sock_fd,
+                     buffer,
+                     sizeof(buffer) - 1,
+                     0);
 
-        printf("\nAgent response:\n%s", buffer);
+            if (bytes_received <= 0)
+            {
+                printf("Agent closed the connection.\n");
+                break;
+            }
+
+            buffer[bytes_received] = '\0';
+
+            printf("\nAgent response:\n%s", buffer);
+        }
 
         if (strcmp(command, "QUIT") == 0)
         {
