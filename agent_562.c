@@ -20,7 +20,6 @@
    TCP HELPER FUNCTIONS
    ========================================================= */
 
-/* Send all bytes reliably */
 int send_all(int socket_fd, const void *data, size_t length)
 {
     const char *buffer = (const char *)data;
@@ -44,17 +43,11 @@ int send_all(int socket_fd, const void *data, size_t length)
     return 0;
 }
 
-/* Send a normal text string */
 int send_text(int socket_fd, const char *text)
 {
     return send_all(socket_fd, text, strlen(text));
 }
 
-/*
- * Receive one newline-terminated protocol line.
- * Reading one byte at a time keeps file bytes separate
- * from the command line that appears before them.
- */
 ssize_t recv_line(int socket_fd,
                   char *buffer,
                   size_t buffer_size)
@@ -104,13 +97,12 @@ ssize_t recv_line(int socket_fd,
     return (ssize_t)position;
 }
 
-/* Receive exactly file_size bytes and write them to a file */
+/* Receive exact bytes from Controller into a file */
 int recv_exact_to_file(int socket_fd,
                        FILE *file,
                        unsigned long long file_size)
 {
     char buffer[BUFFER_SIZE];
-
     unsigned long long remaining = file_size;
 
     while (remaining > 0)
@@ -148,7 +140,54 @@ int recv_exact_to_file(int socket_fd,
             return -1;
         }
 
-        remaining -= (unsigned long long)received;
+        remaining -=
+            (unsigned long long)received;
+    }
+
+    return 0;
+}
+
+/* Send exact file bytes to Controller */
+int send_file_bytes(int socket_fd,
+                    FILE *file,
+                    unsigned long long file_size)
+{
+    char buffer[BUFFER_SIZE];
+    unsigned long long remaining = file_size;
+
+    while (remaining > 0)
+    {
+        size_t amount_to_read;
+
+        if (remaining > sizeof(buffer))
+        {
+            amount_to_read = sizeof(buffer);
+        }
+        else
+        {
+            amount_to_read = (size_t)remaining;
+        }
+
+        size_t bytes_read =
+            fread(buffer,
+                  1,
+                  amount_to_read,
+                  file);
+
+        if (bytes_read == 0)
+        {
+            return -1;
+        }
+
+        if (send_all(socket_fd,
+                     buffer,
+                     bytes_read) < 0)
+        {
+            return -1;
+        }
+
+        remaining -=
+            (unsigned long long)bytes_read;
     }
 
     return 0;
@@ -302,10 +341,9 @@ void execute_whitelist_command(int client_fd,
 }
 
 /* =========================================================
-   PUT
+   FILE VALIDATION
    ========================================================= */
 
-/* Only allow a plain filename, not a path */
 int valid_filename(const char *filename)
 {
     if (filename == NULL ||
@@ -314,6 +352,10 @@ int valid_filename(const char *filename)
         return 0;
     }
 
+    /*
+     * Reject directory traversal and paths.
+     * Only simple filenames are accepted.
+     */
     if (strstr(filename, "..") != NULL ||
         strchr(filename, '/') != NULL ||
         strchr(filename, '\\') != NULL)
@@ -323,6 +365,10 @@ int valid_filename(const char *filename)
 
     return 1;
 }
+
+/* =========================================================
+   PUT
+   ========================================================= */
 
 void handle_put(int client_fd,
                 const char *filename,
@@ -339,10 +385,6 @@ void handle_put(int client_fd,
         return;
     }
 
-    /*
-     * Ensure personalized storage directory exists.
-     * agentfiles was created during project setup.
-     */
     if (mkdir("./agentfiles", 0755) < 0 &&
         errno != EEXIST)
     {
@@ -369,7 +411,8 @@ void handle_put(int client_fd,
              STORAGE_DIR,
              filename);
 
-    FILE *file = fopen(filepath, "wb");
+    FILE *file =
+        fopen(filepath, "wb");
 
     if (file == NULL)
     {
@@ -380,10 +423,6 @@ void handle_put(int client_fd,
         return;
     }
 
-    /*
-     * Tell Controller that the Agent is ready
-     * to receive exactly file_size bytes.
-     */
     send_text(client_fd,
               "OK READY SID:" SID "\n");
 
@@ -407,6 +446,117 @@ void handle_put(int client_fd,
               "OK PUT SID:" SID "\n");
 
     printf("File uploaded: %s (%llu bytes)\n",
+           filepath,
+           file_size);
+}
+
+/* =========================================================
+   GET
+   ========================================================= */
+
+void handle_get(int client_fd,
+                const char *filename)
+{
+    char filepath[1024];
+    char response[1024];
+
+    if (!valid_filename(filename))
+    {
+        send_text(client_fd,
+                  "ERR 006 INVALID_FILENAME SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    snprintf(filepath,
+             sizeof(filepath),
+             "%s/%s",
+             STORAGE_DIR,
+             filename);
+
+    FILE *file =
+        fopen(filepath, "rb");
+
+    if (file == NULL)
+    {
+        send_text(client_fd,
+                  "ERR 010 FILE_NOT_FOUND SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    /*
+     * Determine exact file size.
+     */
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        fclose(file);
+
+        send_text(client_fd,
+                  "ERR 011 GET_FAILED SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    long size = ftell(file);
+
+    if (size < 0)
+    {
+        fclose(file);
+
+        send_text(client_fd,
+                  "ERR 011 GET_FAILED SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    rewind(file);
+
+    unsigned long long file_size =
+        (unsigned long long)size;
+
+    /*
+     * Tell Controller the exact number
+     * of bytes that will follow.
+     */
+    snprintf(response,
+             sizeof(response),
+             "OK GET %llu SID:%s\n",
+             file_size,
+             SID);
+
+    if (send_text(client_fd,
+                  response) < 0)
+    {
+        fclose(file);
+        return;
+    }
+
+    /*
+     * Send exactly file_size bytes.
+     */
+    if (send_file_bytes(client_fd,
+                        file,
+                        file_size) < 0)
+    {
+        fclose(file);
+        return;
+    }
+
+    fclose(file);
+
+    /*
+     * Final newline-terminated response.
+     */
+    send_text(client_fd,
+              "OK GET_COMPLETE SID:"
+              SID "\n");
+
+    printf("File downloaded: %s (%llu bytes)\n",
            filepath,
            file_size);
 }
@@ -451,6 +601,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
+    /* Configure server address */
     memset(&server_addr,
            0,
            sizeof(server_addr));
@@ -459,6 +610,7 @@ int main(void)
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
+    /* Bind */
     if (bind(server_fd,
              (struct sockaddr *)&server_addr,
              sizeof(server_addr)) < 0)
@@ -468,6 +620,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
+    /* Listen */
     if (listen(server_fd, 5) < 0)
     {
         perror("listen");
@@ -480,6 +633,7 @@ int main(void)
            PORT);
     printf("Waiting for a Controller connection...\n");
 
+    /* Accept Controller */
     client_fd =
         accept(server_fd,
                (struct sockaddr *)&client_addr,
@@ -514,7 +668,8 @@ int main(void)
         return 0;
     }
 
-    printf("Received command: %s\n", buffer);
+    printf("Received command: %s\n",
+           buffer);
 
     if (strcmp(buffer,
                "AUTH " AUTH_TOKEN) != 0)
@@ -558,7 +713,8 @@ int main(void)
                buffer);
 
         /* SYSINFO */
-        if (strcmp(buffer, "SYSINFO") == 0)
+        if (strcmp(buffer,
+                   "SYSINFO") == 0)
         {
             send_sysinfo(client_fd);
         }
@@ -589,9 +745,6 @@ int main(void)
             unsigned long long file_size;
             char extra;
 
-            /*
-             * %c detects unexpected extra arguments.
-             */
             int parsed =
                 sscanf(buffer,
                        "PUT %255s %llu %c",
@@ -613,8 +766,36 @@ int main(void)
                        file_size);
         }
 
+        /* GET <filename> */
+        else if (strncmp(buffer,
+                         "GET ",
+                         4) == 0)
+        {
+            char filename[256];
+            char extra;
+
+            int parsed =
+                sscanf(buffer,
+                       "GET %255s %c",
+                       filename,
+                       &extra);
+
+            if (parsed != 1)
+            {
+                send_text(client_fd,
+                          "ERR 012 BAD_GET_FORMAT SID:"
+                          SID "\n");
+
+                continue;
+            }
+
+            handle_get(client_fd,
+                       filename);
+        }
+
         /* QUIT */
-        else if (strcmp(buffer, "QUIT") == 0)
+        else if (strcmp(buffer,
+                        "QUIT") == 0)
         {
             send_text(client_fd,
                       "OK BYE SID:"

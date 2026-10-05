@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 9410
@@ -95,15 +94,63 @@ ssize_t recv_line(int socket_fd,
     return (ssize_t)position;
 }
 
-/* Send a local file exactly */
+/* Receive exactly file_size bytes and save to a file */
+int recv_exact_to_file(int socket_fd,
+                       FILE *file,
+                       unsigned long long file_size)
+{
+    char buffer[BUFFER_SIZE];
+    unsigned long long remaining = file_size;
+
+    while (remaining > 0)
+    {
+        size_t amount_to_receive;
+
+        if (remaining > sizeof(buffer))
+        {
+            amount_to_receive = sizeof(buffer);
+        }
+        else
+        {
+            amount_to_receive = (size_t)remaining;
+        }
+
+        ssize_t received =
+            recv(socket_fd,
+                 buffer,
+                 amount_to_receive,
+                 0);
+
+        if (received <= 0)
+        {
+            return -1;
+        }
+
+        size_t written =
+            fwrite(buffer,
+                   1,
+                   (size_t)received,
+                   file);
+
+        if (written != (size_t)received)
+        {
+            return -1;
+        }
+
+        remaining -=
+            (unsigned long long)received;
+    }
+
+    return 0;
+}
+
+/* Send exact local file bytes for PUT */
 int send_file_bytes(int socket_fd,
                     FILE *file,
                     unsigned long long file_size)
 {
     char buffer[BUFFER_SIZE];
-
-    unsigned long long remaining =
-        file_size;
+    unsigned long long remaining = file_size;
 
     while (remaining > 0)
     {
@@ -111,13 +158,11 @@ int send_file_bytes(int socket_fd,
 
         if (remaining > sizeof(buffer))
         {
-            amount_to_read =
-                sizeof(buffer);
+            amount_to_read = sizeof(buffer);
         }
         else
         {
-            amount_to_read =
-                (size_t)remaining;
+            amount_to_read = (size_t)remaining;
         }
 
         size_t bytes_read =
@@ -146,7 +191,7 @@ int send_file_bytes(int socket_fd,
 }
 
 /* =========================================================
-   RECEIVE MULTI-LINE RESPONSE
+   MULTI-LINE RESPONSES
    ========================================================= */
 
 int receive_until_marker(int socket_fd,
@@ -192,17 +237,9 @@ void handle_put(int socket_fd,
                 const char *command)
 {
     char filename[256];
-    char filepath[512];
     char protocol_command[1024];
     char response[BUFFER_SIZE];
 
-    /*
-     * Controller syntax:
-     * PUT <local-file>
-     *
-     * Example:
-     * PUT test.txt
-     */
     if (sscanf(command,
                "PUT %255s",
                filename) != 1)
@@ -211,26 +248,16 @@ void handle_put(int socket_fd,
         return;
     }
 
-    /*
-     * For this stage the local file is expected
-     * in the current project directory.
-     */
-    snprintf(filepath,
-             sizeof(filepath),
-             "%s",
-             filename);
-
     FILE *file =
-        fopen(filepath, "rb");
+        fopen(filename, "rb");
 
     if (file == NULL)
     {
         printf("Local file not found: %s\n",
-               filepath);
+               filename);
         return;
     }
 
-    /* Determine exact file size */
     if (fseek(file, 0, SEEK_END) != 0)
     {
         printf("Unable to determine file size.\n");
@@ -252,10 +279,6 @@ void handle_put(int socket_fd,
     unsigned long long file_size =
         (unsigned long long)size;
 
-    /*
-     * Protocol sent to Agent:
-     * PUT <filename> <size>\n
-     */
     snprintf(protocol_command,
              sizeof(protocol_command),
              "PUT %s %llu\n",
@@ -271,7 +294,7 @@ void handle_put(int socket_fd,
         return;
     }
 
-    /* Wait for Agent READY response */
+    /* Wait until Agent is ready */
     ssize_t length =
         recv_line(socket_fd,
                   response,
@@ -294,7 +317,6 @@ void handle_put(int socket_fd,
         return;
     }
 
-    /* Send exactly file_size bytes */
     if (send_file_bytes(socket_fd,
                         file,
                         file_size) < 0)
@@ -326,6 +348,151 @@ void handle_put(int socket_fd,
         printf("Upload completed: %s (%llu bytes)\n",
                filename,
                file_size);
+    }
+}
+
+/* =========================================================
+   GET
+   ========================================================= */
+
+void handle_get(int socket_fd,
+                const char *command)
+{
+    char filename[256];
+    char protocol_command[512];
+    char response[BUFFER_SIZE];
+
+    if (sscanf(command,
+               "GET %255s",
+               filename) != 1)
+    {
+        printf("Usage: GET <filename>\n");
+        return;
+    }
+
+    /*
+     * Send GET request to Agent.
+     */
+    snprintf(protocol_command,
+             sizeof(protocol_command),
+             "GET %s\n",
+             filename);
+
+    if (send_all(socket_fd,
+                 protocol_command,
+                 strlen(protocol_command)) < 0)
+    {
+        printf("Failed to send GET command.\n");
+        return;
+    }
+
+    /*
+     * Expected response:
+     * OK GET <size> SID:2651
+     */
+    ssize_t length =
+        recv_line(socket_fd,
+                  response,
+                  sizeof(response));
+
+    if (length <= 0)
+    {
+        printf("Agent closed the connection.\n");
+        return;
+    }
+
+    printf("%s\n", response);
+
+    /* Handle Agent error */
+    if (strncmp(response,
+                "ERR ",
+                4) == 0)
+    {
+        return;
+    }
+
+    unsigned long long file_size;
+    char received_sid[100];
+
+    int parsed =
+        sscanf(response,
+               "OK GET %llu SID:%99s",
+               &file_size,
+               received_sid);
+
+    if (parsed != 2 ||
+        strcmp(received_sid, SID) != 0)
+    {
+        printf("Invalid GET response from Agent.\n");
+        return;
+    }
+
+    /*
+     * Save downloads with a different local name
+     * so we can compare them with the original.
+     *
+     * Example:
+     * test.txt -> downloaded_test.txt
+     */
+    char download_name[512];
+
+    snprintf(download_name,
+             sizeof(download_name),
+             "downloaded_%s",
+             filename);
+
+    FILE *file =
+        fopen(download_name, "wb");
+
+    if (file == NULL)
+    {
+        printf("Unable to create local download file.\n");
+        return;
+    }
+
+    /*
+     * Receive exactly the announced number of bytes.
+     */
+    if (recv_exact_to_file(socket_fd,
+                           file,
+                           file_size) < 0)
+    {
+        fclose(file);
+        remove(download_name);
+
+        printf("File download failed.\n");
+        return;
+    }
+
+    fclose(file);
+
+    /*
+     * After exact file bytes, Agent sends:
+     * OK GET_COMPLETE SID:2651
+     */
+    length =
+        recv_line(socket_fd,
+                  response,
+                  sizeof(response));
+
+    if (length <= 0)
+    {
+        printf("Agent closed the connection.\n");
+        return;
+    }
+
+    printf("%s\n", response);
+
+    if (strcmp(response,
+               "OK GET_COMPLETE SID:" SID) == 0)
+    {
+        printf("Download completed: %s (%llu bytes)\n",
+               download_name,
+               file_size);
+    }
+    else
+    {
+        printf("Unexpected GET completion response.\n");
     }
 }
 
@@ -424,7 +591,8 @@ int main(void)
         return 1;
     }
 
-    printf("Agent response: %s\n", buffer);
+    printf("Agent response: %s\n",
+           buffer);
 
     if (strcmp(buffer,
                "OK AUTHENTICATED SID:" SID) != 0)
@@ -434,9 +602,7 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Remove newline remaining after scanf.
-     */
+    /* Remove newline left by scanf */
     int ch;
 
     while ((ch = getchar()) != '\n' &&
@@ -460,6 +626,7 @@ int main(void)
         printf("  EXEC HOSTNAME\n");
         printf("  EXEC WHOAMI\n");
         printf("  PUT <filename>\n");
+        printf("  GET <filename>\n");
         printf("  QUIT\n");
 
         printf("\nEnter command: ");
@@ -491,7 +658,19 @@ int main(void)
             continue;
         }
 
-        /* Send ordinary command */
+        /* ---------------- GET ---------------- */
+
+        if (strncmp(command,
+                    "GET ",
+                    4) == 0)
+        {
+            handle_get(sock_fd,
+                       command);
+
+            continue;
+        }
+
+        /* Send normal text command */
         snprintf(buffer,
                  sizeof(buffer),
                  "%s\n",
@@ -526,6 +705,16 @@ int main(void)
                 "OK EXEC SID:" SID);
         }
 
+        /* ---------------- SYSINFO ---------------- */
+
+        else if (strcmp(command,
+                        "SYSINFO") == 0)
+        {
+            receive_until_marker(
+                sock_fd,
+                "OK SYSINFO SID:" SID);
+        }
+
         /* ---------------- OTHER ---------------- */
 
         else
@@ -541,32 +730,12 @@ int main(void)
                 break;
             }
 
-            /*
-             * SYSINFO contains multiple lines.
-             * First line has already been received,
-             * so continue until OK SYSINFO.
-             */
-            if (strcmp(command,
-                       "SYSINFO") == 0)
-            {
-                printf("%s\n", buffer);
-
-                if (strstr(buffer,
-                           "OK SYSINFO SID:" SID) == NULL)
-                {
-                    receive_until_marker(
-                        sock_fd,
-                        "OK SYSINFO SID:" SID);
-                }
-            }
-            else
-            {
-                printf("Agent response: %s\n",
-                       buffer);
-            }
+            printf("Agent response: %s\n",
+                   buffer);
         }
 
-        if (strcmp(command, "QUIT") == 0)
+        if (strcmp(command,
+                   "QUIT") == 0)
         {
             break;
         }
