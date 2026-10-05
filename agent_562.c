@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-1562"
@@ -17,52 +18,75 @@
 #define STORAGE_DIR "./agentfiles/IT24101562"
 #define MONITOR_INTERVAL 2
 
+/* =========================================================
+   CLIENT AND MONITOR STRUCTURES
+   ========================================================= */
+
+typedef struct
+{
+    int client_fd;
+    struct sockaddr_in client_addr;
+} ClientInfo;
+
 typedef struct
 {
     int active;
     int udp_port;
     char controller_ip[INET_ADDRSTRLEN];
+
     pthread_t thread;
     pthread_mutex_t lock;
 } MonitorInfo;
-
-MonitorInfo monitor_info = {
-    .active = 0,
-    .udp_port = 0,
-    .controller_ip = "",
-    .lock = PTHREAD_MUTEX_INITIALIZER
-};
 
 /* =========================================================
    TCP HELPER FUNCTIONS
    ========================================================= */
 
-int send_all(int socket_fd, const void *data, size_t length)
+int send_all(int socket_fd,
+             const void *data,
+             size_t length)
 {
-    const char *buffer = (const char *)data;
+    const char *buffer =
+        (const char *)data;
+
     size_t total_sent = 0;
 
     while (total_sent < length)
     {
-        ssize_t sent = send(socket_fd,
-                            buffer + total_sent,
-                            length - total_sent,
-                            0);
+        ssize_t sent =
+            send(socket_fd,
+                 buffer + total_sent,
+                 length - total_sent,
+                 0);
 
-        if (sent <= 0)
+        if (sent < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (sent == 0)
         {
             return -1;
         }
 
-        total_sent += (size_t)sent;
+        total_sent +=
+            (size_t)sent;
     }
 
     return 0;
 }
 
-int send_text(int socket_fd, const char *text)
+int send_text(int socket_fd,
+              const char *text)
 {
-    return send_all(socket_fd, text, strlen(text));
+    return send_all(socket_fd,
+                    text,
+                    strlen(text));
 }
 
 ssize_t recv_line(int socket_fd,
@@ -76,14 +100,16 @@ ssize_t recv_line(int socket_fd,
         return -1;
     }
 
-    while (position < buffer_size - 1)
+    while (position <
+           buffer_size - 1)
     {
         char ch;
 
-        ssize_t received = recv(socket_fd,
-                                &ch,
-                                1,
-                                0);
+        ssize_t received =
+            recv(socket_fd,
+                 &ch,
+                 1,
+                 0);
 
         if (received == 0)
         {
@@ -97,6 +123,11 @@ ssize_t recv_line(int socket_fd,
 
         if (received < 0)
         {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
             return -1;
         }
 
@@ -120,16 +151,19 @@ ssize_t recv_line(int socket_fd,
    FILE TRANSFER HELPERS
    ========================================================= */
 
-int recv_exact_to_file(int socket_fd,
-                       FILE *file,
-                       unsigned long long file_size)
+int recv_exact_to_file(
+    int socket_fd,
+    FILE *file,
+    unsigned long long file_size)
 {
     char buffer[BUFFER_SIZE];
-    unsigned long long remaining = file_size;
+
+    unsigned long long remaining =
+        file_size;
 
     while (remaining > 0)
     {
-        size_t amount_to_receive =
+        size_t amount =
             remaining > sizeof(buffer)
                 ? sizeof(buffer)
                 : (size_t)remaining;
@@ -137,10 +171,20 @@ int recv_exact_to_file(int socket_fd,
         ssize_t received =
             recv(socket_fd,
                  buffer,
-                 amount_to_receive,
+                 amount,
                  0);
 
-        if (received <= 0)
+        if (received < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (received == 0)
         {
             return -1;
         }
@@ -151,28 +195,33 @@ int recv_exact_to_file(int socket_fd,
                    (size_t)received,
                    file);
 
-        if (written != (size_t)received)
+        if (written !=
+            (size_t)received)
         {
             return -1;
         }
 
         remaining -=
-            (unsigned long long)received;
+            (unsigned long long)
+                received;
     }
 
     return 0;
 }
 
-int send_file_bytes(int socket_fd,
-                    FILE *file,
-                    unsigned long long file_size)
+int send_file_bytes(
+    int socket_fd,
+    FILE *file,
+    unsigned long long file_size)
 {
     char buffer[BUFFER_SIZE];
-    unsigned long long remaining = file_size;
+
+    unsigned long long remaining =
+        file_size;
 
     while (remaining > 0)
     {
-        size_t amount_to_read =
+        size_t amount =
             remaining > sizeof(buffer)
                 ? sizeof(buffer)
                 : (size_t)remaining;
@@ -180,7 +229,7 @@ int send_file_bytes(int socket_fd,
         size_t bytes_read =
             fread(buffer,
                   1,
-                  amount_to_read,
+                  amount,
                   file);
 
         if (bytes_read == 0)
@@ -196,7 +245,8 @@ int send_file_bytes(int socket_fd,
         }
 
         remaining -=
-            (unsigned long long)bytes_read;
+            (unsigned long long)
+                bytes_read;
     }
 
     return 0;
@@ -217,11 +267,33 @@ void send_sysinfo(int client_fd)
     long cpu_cores =
         sysconf(_SC_NPROCESSORS_ONLN);
 
-    gethostname(hostname,
-                sizeof(hostname));
+    if (gethostname(hostname,
+                    sizeof(hostname)) != 0)
+    {
+        snprintf(hostname,
+                 sizeof(hostname),
+                 "UNKNOWN");
+    }
 
-    uname(&os_info);
-    sysinfo(&mem_info);
+    if (uname(&os_info) != 0)
+    {
+        send_text(
+            client_fd,
+            "ERR 016 SYSINFO_FAILED SID:"
+            SID "\n");
+
+        return;
+    }
+
+    if (sysinfo(&mem_info) != 0)
+    {
+        send_text(
+            client_fd,
+            "ERR 016 SYSINFO_FAILED SID:"
+            SID "\n");
+
+        return;
+    }
 
     unsigned long total_ram =
         mem_info.totalram *
@@ -233,26 +305,28 @@ void send_sysinfo(int client_fd)
         mem_info.mem_unit /
         (1024 * 1024);
 
-    snprintf(response,
-             sizeof(response),
-             "HOSTNAME: %s\n"
-             "OS: %s\n"
-             "KERNEL: %s\n"
-             "CPU_CORES: %ld\n"
-             "TOTAL_RAM_MB: %lu\n"
-             "FREE_RAM_MB: %lu\n"
-             "UPTIME_SEC: %ld\n"
-             "OK SYSINFO SID:%s\n",
-             hostname,
-             os_info.sysname,
-             os_info.release,
-             cpu_cores,
-             total_ram,
-             free_ram,
-             mem_info.uptime,
-             SID);
+    snprintf(
+        response,
+        sizeof(response),
+        "HOSTNAME: %s\n"
+        "OS: %s\n"
+        "KERNEL: %s\n"
+        "CPU_CORES: %ld\n"
+        "TOTAL_RAM_MB: %lu\n"
+        "FREE_RAM_MB: %lu\n"
+        "UPTIME_SEC: %ld\n"
+        "OK SYSINFO SID:%s\n",
+        hostname,
+        os_info.sysname,
+        os_info.release,
+        cpu_cores,
+        total_ram,
+        free_ram,
+        mem_info.uptime,
+        SID);
 
-    send_text(client_fd, response);
+    send_text(client_fd,
+              response);
 }
 
 /* =========================================================
@@ -265,14 +339,16 @@ void send_listproc(int client_fd)
     char line[512];
 
     fp =
-        popen("ps -eo pid,comm --no-headers",
-              "r");
+        popen(
+            "ps -eo pid,comm --no-headers",
+            "r");
 
     if (fp == NULL)
     {
-        send_text(client_fd,
-                  "ERR 003 LISTPROC_FAILED SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 003 LISTPROC_FAILED SID:"
+            SID "\n");
 
         return;
     }
@@ -284,50 +360,68 @@ void send_listproc(int client_fd)
                  sizeof(line),
                  fp) != NULL)
     {
-        send_text(client_fd, line);
+        if (send_text(client_fd,
+                      line) < 0)
+        {
+            break;
+        }
     }
 
     pclose(fp);
 
-    send_text(client_fd,
-              "OK LISTPROC SID:"
-              SID "\n");
+    send_text(
+        client_fd,
+        "OK LISTPROC SID:"
+        SID "\n");
 }
 
 /* =========================================================
-   EXEC
+   EXEC WHITELIST
    ========================================================= */
 
-void execute_whitelist_command(int client_fd,
-                               const char *name)
+void execute_whitelist_command(
+    int client_fd,
+    const char *name)
 {
-    const char *shell_command = NULL;
+    const char *shell_command =
+        NULL;
 
-    if (strcmp(name, "DATE") == 0)
+    if (strcmp(name,
+               "DATE") == 0)
     {
         shell_command = "date";
     }
-    else if (strcmp(name, "UPTIME") == 0)
+
+    else if (strcmp(name,
+                    "UPTIME") == 0)
     {
         shell_command = "uptime";
     }
-    else if (strcmp(name, "DISKFREE") == 0)
+
+    else if (strcmp(name,
+                    "DISKFREE") == 0)
     {
         shell_command = "df -h";
     }
-    else if (strcmp(name, "HOSTNAME") == 0)
+
+    else if (strcmp(name,
+                    "HOSTNAME") == 0)
     {
         shell_command = "hostname";
     }
-    else if (strcmp(name, "WHOAMI") == 0)
+
+    else if (strcmp(name,
+                    "WHOAMI") == 0)
     {
         shell_command = "whoami";
     }
+
     else
     {
-        send_text(client_fd,
-                  "ERR 004 EXEC_NOT_ALLOWED SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 004 EXEC_NOT_ALLOWED SID:"
+            SID "\n");
 
         return;
     }
@@ -335,13 +429,16 @@ void execute_whitelist_command(int client_fd,
     FILE *fp;
     char line[512];
 
-    fp = popen(shell_command, "r");
+    fp =
+        popen(shell_command,
+              "r");
 
     if (fp == NULL)
     {
-        send_text(client_fd,
-                  "ERR 005 EXEC_FAILED SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 005 EXEC_FAILED SID:"
+            SID "\n");
 
         return;
     }
@@ -350,21 +447,27 @@ void execute_whitelist_command(int client_fd,
                  sizeof(line),
                  fp) != NULL)
     {
-        send_text(client_fd, line);
+        if (send_text(client_fd,
+                      line) < 0)
+        {
+            break;
+        }
     }
 
     pclose(fp);
 
-    send_text(client_fd,
-              "OK EXEC SID:"
-              SID "\n");
+    send_text(
+        client_fd,
+        "OK EXEC SID:"
+        SID "\n");
 }
 
 /* =========================================================
    FILENAME VALIDATION
    ========================================================= */
 
-int valid_filename(const char *filename)
+int valid_filename(
+    const char *filename)
 {
     if (filename == NULL ||
         filename[0] == '\0')
@@ -372,9 +475,12 @@ int valid_filename(const char *filename)
         return 0;
     }
 
-    if (strstr(filename, "..") != NULL ||
-        strchr(filename, '/') != NULL ||
-        strchr(filename, '\\') != NULL)
+    if (strstr(filename,
+               "..") != NULL ||
+        strchr(filename,
+               '/') != NULL ||
+        strchr(filename,
+               '\\') != NULL)
     {
         return 0;
     }
@@ -383,89 +489,118 @@ int valid_filename(const char *filename)
 }
 
 /* =========================================================
+   STORAGE DIRECTORY
+   ========================================================= */
+
+int create_storage_directory(void)
+{
+    if (mkdir("./agentfiles",
+              0755) < 0 &&
+        errno != EEXIST)
+    {
+        return -1;
+    }
+
+    if (mkdir(STORAGE_DIR,
+              0755) < 0 &&
+        errno != EEXIST)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* =========================================================
    PUT
    ========================================================= */
 
-void handle_put(int client_fd,
-                const char *filename,
-                unsigned long long file_size)
+void handle_put(
+    int client_fd,
+    const char *filename,
+    unsigned long long file_size)
 {
     char filepath[1024];
 
     if (!valid_filename(filename))
     {
-        send_text(client_fd,
-                  "ERR 006 INVALID_FILENAME SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 006 INVALID_FILENAME SID:"
+            SID "\n");
 
         return;
     }
 
-    if (mkdir("./agentfiles", 0755) < 0 &&
-        errno != EEXIST)
+    if (create_storage_directory() < 0)
     {
-        send_text(client_fd,
-                  "ERR 007 STORAGE_ERROR SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 007 STORAGE_ERROR SID:"
+            SID "\n");
 
         return;
     }
 
-    if (mkdir(STORAGE_DIR, 0755) < 0 &&
-        errno != EEXIST)
-    {
-        send_text(client_fd,
-                  "ERR 007 STORAGE_ERROR SID:"
-                  SID "\n");
-
-        return;
-    }
-
-    snprintf(filepath,
-             sizeof(filepath),
-             "%s/%s",
-             STORAGE_DIR,
-             filename);
+    snprintf(
+        filepath,
+        sizeof(filepath),
+        "%s/%s",
+        STORAGE_DIR,
+        filename);
 
     FILE *file =
-        fopen(filepath, "wb");
+        fopen(filepath,
+              "wb");
 
     if (file == NULL)
     {
-        send_text(client_fd,
-                  "ERR 007 STORAGE_ERROR SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 007 STORAGE_ERROR SID:"
+            SID "\n");
 
         return;
     }
 
-    send_text(client_fd,
-              "OK READY SID:"
-              SID "\n");
-
-    if (recv_exact_to_file(client_fd,
-                           file,
-                           file_size) < 0)
+    if (send_text(
+            client_fd,
+            "OK READY SID:"
+            SID "\n") < 0)
     {
         fclose(file);
         remove(filepath);
+        return;
+    }
 
-        send_text(client_fd,
-                  "ERR 008 PUT_FAILED SID:"
-                  SID "\n");
+    if (recv_exact_to_file(
+            client_fd,
+            file,
+            file_size) < 0)
+    {
+        fclose(file);
+
+        remove(filepath);
+
+        send_text(
+            client_fd,
+            "ERR 008 PUT_FAILED SID:"
+            SID "\n");
 
         return;
     }
 
     fclose(file);
 
-    send_text(client_fd,
-              "OK PUT SID:"
-              SID "\n");
+    send_text(
+        client_fd,
+        "OK PUT SID:"
+        SID "\n");
 
-    printf("File uploaded: %s (%llu bytes)\n",
-           filepath,
-           file_size);
+    printf(
+        "File uploaded: %s (%llu bytes)\n",
+        filepath,
+        file_size);
 }
 
 /* =========================================================
@@ -480,27 +615,31 @@ void handle_get(int client_fd,
 
     if (!valid_filename(filename))
     {
-        send_text(client_fd,
-                  "ERR 006 INVALID_FILENAME SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 006 INVALID_FILENAME SID:"
+            SID "\n");
 
         return;
     }
 
-    snprintf(filepath,
-             sizeof(filepath),
-             "%s/%s",
-             STORAGE_DIR,
-             filename);
+    snprintf(
+        filepath,
+        sizeof(filepath),
+        "%s/%s",
+        STORAGE_DIR,
+        filename);
 
     FILE *file =
-        fopen(filepath, "rb");
+        fopen(filepath,
+              "rb");
 
     if (file == NULL)
     {
-        send_text(client_fd,
-                  "ERR 010 FILE_NOT_FOUND SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 010 FILE_NOT_FOUND SID:"
+            SID "\n");
 
         return;
     }
@@ -511,22 +650,25 @@ void handle_get(int client_fd,
     {
         fclose(file);
 
-        send_text(client_fd,
-                  "ERR 011 GET_FAILED SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 011 GET_FAILED SID:"
+            SID "\n");
 
         return;
     }
 
-    long size = ftell(file);
+    long size =
+        ftell(file);
 
     if (size < 0)
     {
         fclose(file);
 
-        send_text(client_fd,
-                  "ERR 011 GET_FAILED SID:"
-                  SID "\n");
+        send_text(
+            client_fd,
+            "ERR 011 GET_FAILED SID:"
+            SID "\n");
 
         return;
     }
@@ -536,11 +678,12 @@ void handle_get(int client_fd,
     unsigned long long file_size =
         (unsigned long long)size;
 
-    snprintf(response,
-             sizeof(response),
-             "OK GET %llu SID:%s\n",
-             file_size,
-             SID);
+    snprintf(
+        response,
+        sizeof(response),
+        "OK GET %llu SID:%s\n",
+        file_size,
+        SID);
 
     if (send_text(client_fd,
                   response) < 0)
@@ -549,9 +692,10 @@ void handle_get(int client_fd,
         return;
     }
 
-    if (send_file_bytes(client_fd,
-                        file,
-                        file_size) < 0)
+    if (send_file_bytes(
+            client_fd,
+            file,
+            file_size) < 0)
     {
         fclose(file);
         return;
@@ -559,36 +703,26 @@ void handle_get(int client_fd,
 
     fclose(file);
 
-    send_text(client_fd,
-              "OK GET_COMPLETE SID:"
-              SID "\n");
+    send_text(
+        client_fd,
+        "OK GET_COMPLETE SID:"
+        SID "\n");
 
-    printf("File downloaded: %s (%llu bytes)\n",
-           filepath,
-           file_size);
+    printf(
+        "File downloaded: %s (%llu bytes)\n",
+        filepath,
+        file_size);
 }
 
 /* =========================================================
-   UDP MONITORING
+   UDP MONITOR THREAD
    ========================================================= */
 
-double get_cpu_load(void)
+void *monitor_thread_function(
+    void *arg)
 {
-    struct sysinfo info;
-
-    if (sysinfo(&info) != 0)
-    {
-        return 0.0;
-    }
-
-    return
-        (double)info.loads[0] /
-        65536.0;
-}
-
-void *monitor_thread_function(void *arg)
-{
-    (void)arg;
+    MonitorInfo *monitor =
+        (MonitorInfo *)arg;
 
     int udp_socket =
         socket(AF_INET,
@@ -604,24 +738,25 @@ void *monitor_thread_function(void *arg)
     while (1)
     {
         pthread_mutex_lock(
-            &monitor_info.lock);
+            &monitor->lock);
 
         int active =
-            monitor_info.active;
+            monitor->active;
 
         int udp_port =
-            monitor_info.udp_port;
+            monitor->udp_port;
 
         char controller_ip[
             INET_ADDRSTRLEN];
 
-        snprintf(controller_ip,
-                 sizeof(controller_ip),
-                 "%s",
-                 monitor_info.controller_ip);
+        snprintf(
+            controller_ip,
+            sizeof(controller_ip),
+            "%s",
+            monitor->controller_ip);
 
         pthread_mutex_unlock(
-            &monitor_info.lock);
+            &monitor->lock);
 
         if (!active)
         {
@@ -632,39 +767,45 @@ void *monitor_thread_function(void *arg)
 
         if (sysinfo(&info) == 0)
         {
-            unsigned long total_ram_mb =
-                info.totalram *
-                info.mem_unit /
-                (1024 * 1024);
+            unsigned long
+                total_ram_mb =
+                    info.totalram *
+                    info.mem_unit /
+                    (1024 * 1024);
 
-            unsigned long free_ram_mb =
-                info.freeram *
-                info.mem_unit /
-                (1024 * 1024);
+            unsigned long
+                free_ram_mb =
+                    info.freeram *
+                    info.mem_unit /
+                    (1024 * 1024);
 
-            unsigned long used_ram_mb =
-                total_ram_mb -
-                free_ram_mb;
+            unsigned long
+                used_ram_mb =
+                    total_ram_mb -
+                    free_ram_mb;
 
             double cpu_load =
-                get_cpu_load();
+                (double)info.loads[0] /
+                65536.0;
 
             char message[512];
 
-            snprintf(message,
-                     sizeof(message),
-                     "SYSINFO %.2f %lu %ld SID:%s",
-                     cpu_load,
-                     used_ram_mb,
-                     info.uptime,
-                     SID);
+            snprintf(
+                message,
+                sizeof(message),
+                "SYSINFO %.2f %lu %ld SID:%s",
+                cpu_load,
+                used_ram_mb,
+                info.uptime,
+                SID);
 
             struct sockaddr_in
                 udp_address;
 
-            memset(&udp_address,
-                   0,
-                   sizeof(udp_address));
+            memset(
+                &udp_address,
+                0,
+                sizeof(udp_address));
 
             udp_address.sin_family =
                 AF_INET;
@@ -687,10 +828,6 @@ void *monitor_thread_function(void *arg)
                     (struct sockaddr *)
                         &udp_address,
                     sizeof(udp_address));
-
-                printf(
-                    "UDP monitor sent: %s\n",
-                    message);
             }
         }
 
@@ -702,9 +839,15 @@ void *monitor_thread_function(void *arg)
     return NULL;
 }
 
-int start_monitoring(int client_fd,
-                     const char *controller_ip,
-                     int udp_port)
+/* =========================================================
+   START MONITORING
+   ========================================================= */
+
+int start_monitoring(
+    int client_fd,
+    MonitorInfo *monitor,
+    const char *controller_ip,
+    int udp_port)
 {
     if (udp_port < 1 ||
         udp_port > 65535)
@@ -718,12 +861,12 @@ int start_monitoring(int client_fd,
     }
 
     pthread_mutex_lock(
-        &monitor_info.lock);
+        &monitor->lock);
 
-    if (monitor_info.active)
+    if (monitor->active)
     {
         pthread_mutex_unlock(
-            &monitor_info.lock);
+            &monitor->lock);
 
         send_text(
             client_fd,
@@ -733,32 +876,32 @@ int start_monitoring(int client_fd,
         return -1;
     }
 
-    monitor_info.active = 1;
-    monitor_info.udp_port = udp_port;
+    monitor->active = 1;
+    monitor->udp_port = udp_port;
 
     snprintf(
-        monitor_info.controller_ip,
+        monitor->controller_ip,
         sizeof(
-            monitor_info.controller_ip),
+            monitor->controller_ip),
         "%s",
         controller_ip);
 
     pthread_mutex_unlock(
-        &monitor_info.lock);
+        &monitor->lock);
 
     if (pthread_create(
-            &monitor_info.thread,
+            &monitor->thread,
             NULL,
             monitor_thread_function,
-            NULL) != 0)
+            monitor) != 0)
     {
         pthread_mutex_lock(
-            &monitor_info.lock);
+            &monitor->lock);
 
-        monitor_info.active = 0;
+        monitor->active = 0;
 
         pthread_mutex_unlock(
-            &monitor_info.lock);
+            &monitor->lock);
 
         send_text(
             client_fd,
@@ -781,23 +924,29 @@ int start_monitoring(int client_fd,
     return 0;
 }
 
-void stop_monitoring(int client_fd)
+/* =========================================================
+   STOP MONITORING
+   ========================================================= */
+
+void stop_monitoring(
+    int client_fd,
+    MonitorInfo *monitor)
 {
     pthread_mutex_lock(
-        &monitor_info.lock);
+        &monitor->lock);
 
     int was_active =
-        monitor_info.active;
+        monitor->active;
 
-    monitor_info.active = 0;
+    monitor->active = 0;
 
     pthread_mutex_unlock(
-        &monitor_info.lock);
+        &monitor->lock);
 
     if (was_active)
     {
         pthread_join(
-            monitor_info.thread,
+            monitor->thread,
             NULL);
     }
 
@@ -805,150 +954,81 @@ void stop_monitoring(int client_fd)
         client_fd,
         "OK MONITOR_STOPPED SID:"
         SID "\n");
-
-    printf("UDP monitoring stopped.\n");
 }
 
-void stop_monitoring_on_disconnect(void)
+void stop_monitoring_disconnect(
+    MonitorInfo *monitor)
 {
     pthread_mutex_lock(
-        &monitor_info.lock);
+        &monitor->lock);
 
     int was_active =
-        monitor_info.active;
+        monitor->active;
 
-    monitor_info.active = 0;
+    monitor->active = 0;
 
     pthread_mutex_unlock(
-        &monitor_info.lock);
+        &monitor->lock);
 
     if (was_active)
     {
         pthread_join(
-            monitor_info.thread,
+            monitor->thread,
             NULL);
     }
 }
 
 /* =========================================================
-   MAIN
+   CLIENT THREAD
    ========================================================= */
 
-int main(void)
+void *handle_client(void *arg)
 {
-    int server_fd;
-    int client_fd;
+    ClientInfo *client_info =
+        (ClientInfo *)arg;
 
-    struct sockaddr_in server_addr;
-    struct sockaddr_in client_addr;
+    int client_fd =
+        client_info->client_fd;
 
-    socklen_t client_len =
-        sizeof(client_addr);
+    struct sockaddr_in client_addr =
+        client_info->client_addr;
 
-    char buffer[BUFFER_SIZE];
-
-    server_fd =
-        socket(AF_INET,
-               SOCK_STREAM,
-               0);
-
-    if (server_fd < 0)
-    {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    int opt = 1;
-
-    if (setsockopt(
-            server_fd,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &opt,
-            sizeof(opt)) < 0)
-    {
-        perror("setsockopt");
-
-        close(server_fd);
-
-        exit(EXIT_FAILURE);
-    }
-
-    memset(&server_addr,
-           0,
-           sizeof(server_addr));
-
-    server_addr.sin_family =
-        AF_INET;
-
-    server_addr.sin_addr.s_addr =
-        INADDR_ANY;
-
-    server_addr.sin_port =
-        htons(PORT);
-
-    if (bind(
-            server_fd,
-            (struct sockaddr *)
-                &server_addr,
-            sizeof(server_addr)) < 0)
-    {
-        perror("bind");
-
-        close(server_fd);
-
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_fd, 5) < 0)
-    {
-        perror("listen");
-
-        close(server_fd);
-
-        exit(EXIT_FAILURE);
-    }
-
-    printf(
-        "RemoteOps Agent - IT24101562\n");
-
-    printf(
-        "Agent listening on TCP port %d...\n",
-        PORT);
-
-    printf(
-        "Waiting for a Controller connection...\n");
-
-    client_fd =
-        accept(
-            server_fd,
-            (struct sockaddr *)
-                &client_addr,
-            &client_len);
-
-    if (client_fd < 0)
-    {
-        perror("accept");
-
-        close(server_fd);
-
-        exit(EXIT_FAILURE);
-    }
+    free(client_info);
 
     char controller_ip[
         INET_ADDRSTRLEN];
 
-    inet_ntop(
-        AF_INET,
-        &client_addr.sin_addr,
-        controller_ip,
-        sizeof(controller_ip));
+    if (inet_ntop(
+            AF_INET,
+            &client_addr.sin_addr,
+            controller_ip,
+            sizeof(controller_ip)) == NULL)
+    {
+        snprintf(
+            controller_ip,
+            sizeof(controller_ip),
+            "UNKNOWN");
+    }
 
     printf(
         "Controller connected from %s\n",
         controller_ip);
 
-    /* Authentication */
+    MonitorInfo monitor;
+
+    memset(&monitor,
+           0,
+           sizeof(monitor));
+
+    pthread_mutex_init(
+        &monitor.lock,
+        NULL);
+
+    char buffer[BUFFER_SIZE];
+
+    /* =====================================================
+       AUTHENTICATION
+       ===================================================== */
 
     ssize_t line_length =
         recv_line(
@@ -959,16 +1039,20 @@ int main(void)
     if (line_length <= 0)
     {
         printf(
-            "Controller disconnected.\n");
+            "Controller %s disconnected before authentication.\n",
+            controller_ip);
 
         close(client_fd);
-        close(server_fd);
 
-        return 0;
+        pthread_mutex_destroy(
+            &monitor.lock);
+
+        return NULL;
     }
 
     printf(
-        "Received command: %s\n",
+        "[%s] Received: %s\n",
+        controller_ip,
         buffer);
 
     if (strcmp(
@@ -981,12 +1065,15 @@ int main(void)
             SID "\n");
 
         printf(
-            "Authentication failed.\n");
+            "[%s] Authentication failed.\n",
+            controller_ip);
 
         close(client_fd);
-        close(server_fd);
 
-        return 0;
+        pthread_mutex_destroy(
+            &monitor.lock);
+
+        return NULL;
     }
 
     send_text(
@@ -995,10 +1082,11 @@ int main(void)
         SID "\n");
 
     printf(
-        "Authentication successful.\n");
+        "[%s] Authentication successful.\n",
+        controller_ip);
 
     /* =====================================================
-       COMMAND LOOP
+       COMMAND LOOP FOR THIS CONTROLLER
        ===================================================== */
 
     while (1)
@@ -1012,30 +1100,41 @@ int main(void)
         if (line_length <= 0)
         {
             printf(
-                "Controller disconnected.\n");
+                "[%s] Controller disconnected.\n",
+                controller_ip);
 
-            stop_monitoring_on_disconnect();
+            stop_monitoring_disconnect(
+                &monitor);
 
             break;
         }
 
         printf(
-            "Received command: %s\n",
+            "[%s] Received: %s\n",
+            controller_ip,
             buffer);
+
+        /* ---------------- SYSINFO ---------------- */
 
         if (strcmp(
                 buffer,
                 "SYSINFO") == 0)
         {
-            send_sysinfo(client_fd);
+            send_sysinfo(
+                client_fd);
         }
+
+        /* ---------------- LISTPROC ---------------- */
 
         else if (strcmp(
                      buffer,
                      "LISTPROC") == 0)
         {
-            send_listproc(client_fd);
+            send_listproc(
+                client_fd);
         }
+
+        /* ---------------- EXEC ---------------- */
 
         else if (strncmp(
                      buffer,
@@ -1046,6 +1145,8 @@ int main(void)
                 client_fd,
                 buffer + 5);
         }
+
+        /* ---------------- PUT ---------------- */
 
         else if (strncmp(
                      buffer,
@@ -1083,6 +1184,8 @@ int main(void)
                 file_size);
         }
 
+        /* ---------------- GET ---------------- */
+
         else if (strncmp(
                      buffer,
                      "GET ",
@@ -1113,6 +1216,8 @@ int main(void)
                 filename);
         }
 
+        /* ---------------- MONITOR START ---------------- */
+
         else if (strncmp(
                      buffer,
                      "MONITOR START ",
@@ -1140,23 +1245,30 @@ int main(void)
 
             start_monitoring(
                 client_fd,
+                &monitor,
                 controller_ip,
                 udp_port);
         }
+
+        /* ---------------- MONITOR STOP ---------------- */
 
         else if (strcmp(
                      buffer,
                      "MONITOR STOP") == 0)
         {
             stop_monitoring(
-                client_fd);
+                client_fd,
+                &monitor);
         }
+
+        /* ---------------- QUIT ---------------- */
 
         else if (strcmp(
                      buffer,
                      "QUIT") == 0)
         {
-            stop_monitoring_on_disconnect();
+            stop_monitoring_disconnect(
+                &monitor);
 
             send_text(
                 client_fd,
@@ -1164,10 +1276,13 @@ int main(void)
                 SID "\n");
 
             printf(
-                "Controller requested disconnect.\n");
+                "[%s] Controller requested disconnect.\n",
+                controller_ip);
 
             break;
         }
+
+        /* ---------------- UNKNOWN ---------------- */
 
         else
         {
@@ -1179,8 +1294,197 @@ int main(void)
     }
 
     close(client_fd);
+
+    pthread_mutex_destroy(
+        &monitor.lock);
+
+    printf(
+        "Controller thread for %s finished.\n",
+        controller_ip);
+
+    return NULL;
+}
+
+/* =========================================================
+   MAIN SERVER
+   ========================================================= */
+
+int main(void)
+{
+    int server_fd;
+
+    struct sockaddr_in
+        server_addr;
+
+    /*
+     * Prevent the Agent from terminating if it
+     * sends to a Controller that disconnected.
+     */
+    signal(SIGPIPE,
+           SIG_IGN);
+
+    server_fd =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0);
+
+    if (server_fd < 0)
+    {
+        perror("socket");
+
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+
+    if (setsockopt(
+            server_fd,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &opt,
+            sizeof(opt)) < 0)
+    {
+        perror("setsockopt");
+
+        close(server_fd);
+
+        exit(EXIT_FAILURE);
+    }
+
+    memset(
+        &server_addr,
+        0,
+        sizeof(server_addr));
+
+    server_addr.sin_family =
+        AF_INET;
+
+    server_addr.sin_addr.s_addr =
+        INADDR_ANY;
+
+    server_addr.sin_port =
+        htons(PORT);
+
+    if (bind(
+            server_fd,
+            (struct sockaddr *)
+                &server_addr,
+            sizeof(server_addr)) < 0)
+    {
+        perror("bind");
+
+        close(server_fd);
+
+        exit(EXIT_FAILURE);
+    }
+
+    /*
+     * Backlog is larger than five so the server
+     * can comfortably accept at least five
+     * simultaneous Controllers.
+     */
+    if (listen(server_fd,
+               10) < 0)
+    {
+        perror("listen");
+
+        close(server_fd);
+
+        exit(EXIT_FAILURE);
+    }
+
+    printf(
+        "RemoteOps Agent - IT24101562\n");
+
+    printf(
+        "Agent listening on TCP port %d...\n",
+        PORT);
+
+    printf(
+        "Concurrent Controller support enabled.\n");
+
+    printf(
+        "Waiting for Controller connections...\n");
+
+    /*
+     * Keep accepting Controllers.
+     * Each accepted Controller gets its own thread.
+     */
+    while (1)
+    {
+        struct sockaddr_in
+            client_addr;
+
+        socklen_t client_len =
+            sizeof(client_addr);
+
+        int client_fd =
+            accept(
+                server_fd,
+                (struct sockaddr *)
+                    &client_addr,
+                &client_len);
+
+        if (client_fd < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            perror("accept");
+            continue;
+        }
+
+        ClientInfo *client_info =
+            malloc(
+                sizeof(ClientInfo));
+
+        if (client_info == NULL)
+        {
+            fprintf(
+                stderr,
+                "Unable to allocate client information.\n");
+
+            close(client_fd);
+
+            continue;
+        }
+
+        client_info->client_fd =
+            client_fd;
+
+        client_info->client_addr =
+            client_addr;
+
+        pthread_t client_thread;
+
+        if (pthread_create(
+                &client_thread,
+                NULL,
+                handle_client,
+                client_info) != 0)
+        {
+            perror(
+                "pthread_create");
+
+            close(client_fd);
+
+            free(client_info);
+
+            continue;
+        }
+
+        /*
+         * Detached threads clean themselves up
+         * when the Controller disconnects.
+         */
+        pthread_detach(
+            client_thread);
+    }
+
     close(server_fd);
 
     return 0;
 }
-
