@@ -15,7 +15,7 @@ int main(void)
     struct sockaddr_in server_addr;
 
     char token[100];
-    char command[150];
+    char command[200];
     char buffer[BUFFER_SIZE];
 
     ssize_t bytes_received;
@@ -108,12 +108,22 @@ int main(void)
 
     printf("Agent response: %s", buffer);
 
-    /* Check authentication */
     if (strstr(buffer, "OK AUTHENTICATED") == NULL)
     {
         printf("Authentication failed. Closing connection.\n");
         close(sock_fd);
         return 1;
+    }
+
+    /*
+     * Remove the newline left by scanf so that
+     * fgets() can be used for commands containing spaces.
+     */
+    int ch;
+
+    while ((ch = getchar()) != '\n' && ch != EOF)
+    {
+        /* discard remaining input */
     }
 
     /* ===================================== */
@@ -122,22 +132,41 @@ int main(void)
 
     while (1)
     {
-        printf("\nEnter command "
-               "(SYSINFO, LISTPROC or QUIT): ");
+        printf("\nAvailable commands:\n");
+        printf("  SYSINFO\n");
+        printf("  LISTPROC\n");
+        printf("  EXEC DATE\n");
+        printf("  EXEC UPTIME\n");
+        printf("  EXEC DISKFREE\n");
+        printf("  EXEC HOSTNAME\n");
+        printf("  EXEC WHOAMI\n");
+        printf("  QUIT\n");
 
-        if (scanf("%149s", command) != 1)
+        printf("\nEnter command: ");
+
+        if (fgets(command,
+                  sizeof(command),
+                  stdin) == NULL)
         {
             break;
         }
 
-        char send_buffer[200];
+        /* Remove newline from keyboard input */
+        command[strcspn(command, "\r\n")] = '\0';
+
+        if (strlen(command) == 0)
+        {
+            continue;
+        }
+
+        /* Add protocol newline */
+        char send_buffer[250];
 
         snprintf(send_buffer,
                  sizeof(send_buffer),
                  "%s\n",
                  command);
 
-        /* Send command to Agent */
         if (send(sock_fd,
                  send_buffer,
                  strlen(send_buffer),
@@ -148,11 +177,11 @@ int main(void)
         }
 
         /*
-         * LISTPROC can contain many lines.
-         * Keep receiving until the final
-         * OK LISTPROC response is received.
+         * LISTPROC and EXEC may return multiple
+         * TCP receive blocks.
          */
-        if (strcmp(command, "LISTPROC") == 0)
+        if (strcmp(command, "LISTPROC") == 0 ||
+            strncmp(command, "EXEC ", 5) == 0)
         {
             while (1)
             {
@@ -174,8 +203,16 @@ int main(void)
 
                 printf("%s", buffer);
 
+                /*
+                 * Successful LISTPROC / EXEC or
+                 * an ERR response finishes command.
+                 */
                 if (strstr(buffer,
-                           "OK LISTPROC SID:2651") != NULL)
+                           "OK LISTPROC SID:2651") != NULL ||
+                    strstr(buffer,
+                           "OK EXEC SID:2651") != NULL ||
+                    strstr(buffer,
+                           "ERR ") != NULL)
                 {
                     break;
                 }

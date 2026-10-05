@@ -54,13 +54,12 @@ void send_sysinfo(int client_fd)
     send(client_fd, response, strlen(response), 0);
 }
 
-/* Send running process information to the Controller */
+/* Send running process information */
 void send_listproc(int client_fd)
 {
     FILE *fp;
     char line[512];
 
-    /* Execute ps command and read its output */
     fp = popen("ps -eo pid,comm --no-headers", "r");
 
     if (fp == NULL)
@@ -68,41 +67,90 @@ void send_listproc(int client_fd)
         const char *error =
             "ERR 003 LISTPROC_FAILED SID:" SID "\n";
 
-        send(client_fd,
-             error,
-             strlen(error),
-             0);
-
+        send(client_fd, error, strlen(error), 0);
         return;
     }
 
-    /* Send table heading */
     const char *header = "PID COMMAND\n";
 
-    send(client_fd,
-         header,
-         strlen(header),
-         0);
+    send(client_fd, header, strlen(header), 0);
 
-    /* Send each process to the Controller */
     while (fgets(line, sizeof(line), fp) != NULL)
     {
-        send(client_fd,
-             line,
-             strlen(line),
-             0);
+        send(client_fd, line, strlen(line), 0);
     }
 
     pclose(fp);
 
-    /* Tell Controller that LISTPROC is complete */
     const char *end =
         "OK LISTPROC SID:" SID "\n";
 
-    send(client_fd,
-         end,
-         strlen(end),
-         0);
+    send(client_fd, end, strlen(end), 0);
+}
+
+/* Execute only approved whitelist commands */
+void execute_whitelist_command(int client_fd, const char *name)
+{
+    const char *shell_command = NULL;
+
+    /*
+     * Only these commands are allowed.
+     * User input is never passed directly to popen().
+     */
+    if (strcmp(name, "DATE") == 0)
+    {
+        shell_command = "date";
+    }
+    else if (strcmp(name, "UPTIME") == 0)
+    {
+        shell_command = "uptime";
+    }
+    else if (strcmp(name, "DISKFREE") == 0)
+    {
+        shell_command = "df -h";
+    }
+    else if (strcmp(name, "HOSTNAME") == 0)
+    {
+        shell_command = "hostname";
+    }
+    else if (strcmp(name, "WHOAMI") == 0)
+    {
+        shell_command = "whoami";
+    }
+    else
+    {
+        const char *error =
+            "ERR 004 EXEC_NOT_ALLOWED SID:" SID "\n";
+
+        send(client_fd, error, strlen(error), 0);
+        return;
+    }
+
+    FILE *fp;
+    char line[512];
+
+    fp = popen(shell_command, "r");
+
+    if (fp == NULL)
+    {
+        const char *error =
+            "ERR 005 EXEC_FAILED SID:" SID "\n";
+
+        send(client_fd, error, strlen(error), 0);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        send(client_fd, line, strlen(line), 0);
+    }
+
+    pclose(fp);
+
+    const char *end =
+        "OK EXEC SID:" SID "\n";
+
+    send(client_fd, end, strlen(end), 0);
 }
 
 int main(void)
@@ -141,7 +189,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Configure Agent address */
+    /* Configure server address */
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
@@ -158,7 +206,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Listen for Controller connections */
+    /* Listen for connections */
     if (listen(server_fd, 5) < 0)
     {
         perror("listen");
@@ -208,13 +256,10 @@ int main(void)
     }
 
     buffer[bytes_received] = '\0';
-
-    /* Remove newline */
     buffer[strcspn(buffer, "\r\n")] = '\0';
 
     printf("Received command: %s\n", buffer);
 
-    /* Check authentication token */
     if (strcmp(buffer, "AUTH " AUTH_TOKEN) != 0)
     {
         const char *response =
@@ -233,7 +278,6 @@ int main(void)
         return 0;
     }
 
-    /* Authentication successful */
     const char *auth_response =
         "OK AUTHENTICATED SID:" SID "\n";
 
@@ -265,25 +309,32 @@ int main(void)
         }
 
         buffer[bytes_received] = '\0';
-
-        /* Remove newline */
         buffer[strcspn(buffer, "\r\n")] = '\0';
 
         printf("Received command: %s\n", buffer);
 
-        /* SYSINFO command */
+        /* SYSINFO */
         if (strcmp(buffer, "SYSINFO") == 0)
         {
             send_sysinfo(client_fd);
         }
 
-        /* LISTPROC command */
+        /* LISTPROC */
         else if (strcmp(buffer, "LISTPROC") == 0)
         {
             send_listproc(client_fd);
         }
 
-        /* QUIT command */
+        /* EXEC */
+        else if (strncmp(buffer, "EXEC ", 5) == 0)
+        {
+            const char *exec_name = buffer + 5;
+
+            execute_whitelist_command(client_fd,
+                                      exec_name);
+        }
+
+        /* QUIT */
         else if (strcmp(buffer, "QUIT") == 0)
         {
             const char *response =
@@ -295,7 +346,6 @@ int main(void)
                  0);
 
             printf("Controller requested disconnect.\n");
-
             break;
         }
 
@@ -312,7 +362,6 @@ int main(void)
         }
     }
 
-    /* Close sockets */
     close(client_fd);
     close(server_fd);
 
