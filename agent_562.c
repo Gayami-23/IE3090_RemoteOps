@@ -6,13 +6,158 @@
 #include <sys/socket.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-1562"
 #define SID "2651"
-#define BUFFER_SIZE 1024
 
-/* Send system information to the Controller */
+#define BUFFER_SIZE 4096
+#define STORAGE_DIR "./agentfiles/IT24101562"
+
+/* =========================================================
+   TCP HELPER FUNCTIONS
+   ========================================================= */
+
+/* Send all bytes reliably */
+int send_all(int socket_fd, const void *data, size_t length)
+{
+    const char *buffer = (const char *)data;
+    size_t total_sent = 0;
+
+    while (total_sent < length)
+    {
+        ssize_t sent = send(socket_fd,
+                            buffer + total_sent,
+                            length - total_sent,
+                            0);
+
+        if (sent <= 0)
+        {
+            return -1;
+        }
+
+        total_sent += (size_t)sent;
+    }
+
+    return 0;
+}
+
+/* Send a normal text string */
+int send_text(int socket_fd, const char *text)
+{
+    return send_all(socket_fd, text, strlen(text));
+}
+
+/*
+ * Receive one newline-terminated protocol line.
+ * Reading one byte at a time keeps file bytes separate
+ * from the command line that appears before them.
+ */
+ssize_t recv_line(int socket_fd,
+                  char *buffer,
+                  size_t buffer_size)
+{
+    size_t position = 0;
+
+    if (buffer_size == 0)
+    {
+        return -1;
+    }
+
+    while (position < buffer_size - 1)
+    {
+        char ch;
+
+        ssize_t received =
+            recv(socket_fd, &ch, 1, 0);
+
+        if (received == 0)
+        {
+            if (position == 0)
+            {
+                return 0;
+            }
+
+            break;
+        }
+
+        if (received < 0)
+        {
+            return -1;
+        }
+
+        if (ch == '\n')
+        {
+            break;
+        }
+
+        if (ch != '\r')
+        {
+            buffer[position++] = ch;
+        }
+    }
+
+    buffer[position] = '\0';
+
+    return (ssize_t)position;
+}
+
+/* Receive exactly file_size bytes and write them to a file */
+int recv_exact_to_file(int socket_fd,
+                       FILE *file,
+                       unsigned long long file_size)
+{
+    char buffer[BUFFER_SIZE];
+
+    unsigned long long remaining = file_size;
+
+    while (remaining > 0)
+    {
+        size_t amount_to_receive;
+
+        if (remaining > sizeof(buffer))
+        {
+            amount_to_receive = sizeof(buffer);
+        }
+        else
+        {
+            amount_to_receive = (size_t)remaining;
+        }
+
+        ssize_t received =
+            recv(socket_fd,
+                 buffer,
+                 amount_to_receive,
+                 0);
+
+        if (received <= 0)
+        {
+            return -1;
+        }
+
+        size_t written =
+            fwrite(buffer,
+                   1,
+                   (size_t)received,
+                   file);
+
+        if (written != (size_t)received)
+        {
+            return -1;
+        }
+
+        remaining -= (unsigned long long)received;
+    }
+
+    return 0;
+}
+
+/* =========================================================
+   SYSINFO
+   ========================================================= */
+
 void send_sysinfo(int client_fd)
 {
     char response[2048];
@@ -21,19 +166,25 @@ void send_sysinfo(int client_fd)
     struct utsname os_info;
     struct sysinfo mem_info;
 
-    long cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    long cpu_cores =
+        sysconf(_SC_NPROCESSORS_ONLN);
 
     gethostname(hostname, sizeof(hostname));
     uname(&os_info);
     sysinfo(&mem_info);
 
     unsigned long total_ram =
-        mem_info.totalram * mem_info.mem_unit / (1024 * 1024);
+        mem_info.totalram *
+        mem_info.mem_unit /
+        (1024 * 1024);
 
     unsigned long free_ram =
-        mem_info.freeram * mem_info.mem_unit / (1024 * 1024);
+        mem_info.freeram *
+        mem_info.mem_unit /
+        (1024 * 1024);
 
-    snprintf(response, sizeof(response),
+    snprintf(response,
+             sizeof(response),
              "HOSTNAME: %s\n"
              "OS: %s\n"
              "KERNEL: %s\n"
@@ -51,10 +202,13 @@ void send_sysinfo(int client_fd)
              mem_info.uptime,
              SID);
 
-    send(client_fd, response, strlen(response), 0);
+    send_text(client_fd, response);
 }
 
-/* Send running process information */
+/* =========================================================
+   LISTPROC
+   ========================================================= */
+
 void send_listproc(int client_fd)
 {
     FILE *fp;
@@ -64,39 +218,35 @@ void send_listproc(int client_fd)
 
     if (fp == NULL)
     {
-        const char *error =
-            "ERR 003 LISTPROC_FAILED SID:" SID "\n";
+        send_text(client_fd,
+                  "ERR 003 LISTPROC_FAILED SID:"
+                  SID "\n");
 
-        send(client_fd, error, strlen(error), 0);
         return;
     }
 
-    const char *header = "PID COMMAND\n";
-
-    send(client_fd, header, strlen(header), 0);
+    send_text(client_fd, "PID COMMAND\n");
 
     while (fgets(line, sizeof(line), fp) != NULL)
     {
-        send(client_fd, line, strlen(line), 0);
+        send_text(client_fd, line);
     }
 
     pclose(fp);
 
-    const char *end =
-        "OK LISTPROC SID:" SID "\n";
-
-    send(client_fd, end, strlen(end), 0);
+    send_text(client_fd,
+              "OK LISTPROC SID:" SID "\n");
 }
 
-/* Execute only approved whitelist commands */
-void execute_whitelist_command(int client_fd, const char *name)
+/* =========================================================
+   EXEC
+   ========================================================= */
+
+void execute_whitelist_command(int client_fd,
+                               const char *name)
 {
     const char *shell_command = NULL;
 
-    /*
-     * Only these commands are allowed.
-     * User input is never passed directly to popen().
-     */
     if (strcmp(name, "DATE") == 0)
     {
         shell_command = "date";
@@ -119,10 +269,10 @@ void execute_whitelist_command(int client_fd, const char *name)
     }
     else
     {
-        const char *error =
-            "ERR 004 EXEC_NOT_ALLOWED SID:" SID "\n";
+        send_text(client_fd,
+                  "ERR 004 EXEC_NOT_ALLOWED SID:"
+                  SID "\n");
 
-        send(client_fd, error, strlen(error), 0);
         return;
     }
 
@@ -133,25 +283,137 @@ void execute_whitelist_command(int client_fd, const char *name)
 
     if (fp == NULL)
     {
-        const char *error =
-            "ERR 005 EXEC_FAILED SID:" SID "\n";
+        send_text(client_fd,
+                  "ERR 005 EXEC_FAILED SID:"
+                  SID "\n");
 
-        send(client_fd, error, strlen(error), 0);
         return;
     }
 
     while (fgets(line, sizeof(line), fp) != NULL)
     {
-        send(client_fd, line, strlen(line), 0);
+        send_text(client_fd, line);
     }
 
     pclose(fp);
 
-    const char *end =
-        "OK EXEC SID:" SID "\n";
-
-    send(client_fd, end, strlen(end), 0);
+    send_text(client_fd,
+              "OK EXEC SID:" SID "\n");
 }
+
+/* =========================================================
+   PUT
+   ========================================================= */
+
+/* Only allow a plain filename, not a path */
+int valid_filename(const char *filename)
+{
+    if (filename == NULL ||
+        filename[0] == '\0')
+    {
+        return 0;
+    }
+
+    if (strstr(filename, "..") != NULL ||
+        strchr(filename, '/') != NULL ||
+        strchr(filename, '\\') != NULL)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+void handle_put(int client_fd,
+                const char *filename,
+                unsigned long long file_size)
+{
+    char filepath[1024];
+
+    if (!valid_filename(filename))
+    {
+        send_text(client_fd,
+                  "ERR 006 INVALID_FILENAME SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    /*
+     * Ensure personalized storage directory exists.
+     * agentfiles was created during project setup.
+     */
+    if (mkdir("./agentfiles", 0755) < 0 &&
+        errno != EEXIST)
+    {
+        send_text(client_fd,
+                  "ERR 007 STORAGE_ERROR SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    if (mkdir(STORAGE_DIR, 0755) < 0 &&
+        errno != EEXIST)
+    {
+        send_text(client_fd,
+                  "ERR 007 STORAGE_ERROR SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    snprintf(filepath,
+             sizeof(filepath),
+             "%s/%s",
+             STORAGE_DIR,
+             filename);
+
+    FILE *file = fopen(filepath, "wb");
+
+    if (file == NULL)
+    {
+        send_text(client_fd,
+                  "ERR 007 STORAGE_ERROR SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    /*
+     * Tell Controller that the Agent is ready
+     * to receive exactly file_size bytes.
+     */
+    send_text(client_fd,
+              "OK READY SID:" SID "\n");
+
+    if (recv_exact_to_file(client_fd,
+                           file,
+                           file_size) < 0)
+    {
+        fclose(file);
+        remove(filepath);
+
+        send_text(client_fd,
+                  "ERR 008 PUT_FAILED SID:"
+                  SID "\n");
+
+        return;
+    }
+
+    fclose(file);
+
+    send_text(client_fd,
+              "OK PUT SID:" SID "\n");
+
+    printf("File uploaded: %s (%llu bytes)\n",
+           filepath,
+           file_size);
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
 
 int main(void)
 {
@@ -161,13 +423,14 @@ int main(void)
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
 
-    socklen_t client_len = sizeof(client_addr);
+    socklen_t client_len =
+        sizeof(client_addr);
 
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_received;
 
     /* Create TCP socket */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd =
+        socket(AF_INET, SOCK_STREAM, 0);
 
     if (server_fd < 0)
     {
@@ -175,7 +438,6 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Allow port reuse */
     int opt = 1;
 
     if (setsockopt(server_fd,
@@ -189,14 +451,14 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Configure server address */
-    memset(&server_addr, 0, sizeof(server_addr));
+    memset(&server_addr,
+           0,
+           sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    /* Bind socket */
     if (bind(server_fd,
              (struct sockaddr *)&server_addr,
              sizeof(server_addr)) < 0)
@@ -206,7 +468,6 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Listen for connections */
     if (listen(server_fd, 5) < 0)
     {
         perror("listen");
@@ -215,13 +476,14 @@ int main(void)
     }
 
     printf("RemoteOps Agent - IT24101562\n");
-    printf("Agent listening on TCP port %d...\n", PORT);
+    printf("Agent listening on TCP port %d...\n",
+           PORT);
     printf("Waiting for a Controller connection...\n");
 
-    /* Accept Controller */
-    client_fd = accept(server_fd,
-                       (struct sockaddr *)&client_addr,
-                       &client_len);
+    client_fd =
+        accept(server_fd,
+               (struct sockaddr *)&client_addr,
+               &client_len);
 
     if (client_fd < 0)
     {
@@ -233,19 +495,16 @@ int main(void)
     printf("Controller connected from %s\n",
            inet_ntoa(client_addr.sin_addr));
 
-    /* ===================================== */
-    /* AUTHENTICATION                        */
-    /* ===================================== */
+    /* =====================================================
+       AUTHENTICATION
+       ===================================================== */
 
-    memset(buffer, 0, sizeof(buffer));
+    ssize_t line_length =
+        recv_line(client_fd,
+                  buffer,
+                  sizeof(buffer));
 
-    bytes_received =
-        recv(client_fd,
-             buffer,
-             sizeof(buffer) - 1,
-             0);
-
-    if (bytes_received <= 0)
+    if (line_length <= 0)
     {
         printf("Controller disconnected.\n");
 
@@ -255,20 +514,14 @@ int main(void)
         return 0;
     }
 
-    buffer[bytes_received] = '\0';
-    buffer[strcspn(buffer, "\r\n")] = '\0';
-
     printf("Received command: %s\n", buffer);
 
-    if (strcmp(buffer, "AUTH " AUTH_TOKEN) != 0)
+    if (strcmp(buffer,
+               "AUTH " AUTH_TOKEN) != 0)
     {
-        const char *response =
-            "ERR 001 AUTH_FAILED SID:" SID "\n";
-
-        send(client_fd,
-             response,
-             strlen(response),
-             0);
+        send_text(client_fd,
+                  "ERR 001 AUTH_FAILED SID:"
+                  SID "\n");
 
         printf("Authentication failed.\n");
 
@@ -278,40 +531,31 @@ int main(void)
         return 0;
     }
 
-    const char *auth_response =
-        "OK AUTHENTICATED SID:" SID "\n";
-
-    send(client_fd,
-         auth_response,
-         strlen(auth_response),
-         0);
+    send_text(client_fd,
+              "OK AUTHENTICATED SID:"
+              SID "\n");
 
     printf("Authentication successful.\n");
 
-    /* ===================================== */
-    /* COMMAND LOOP                          */
-    /* ===================================== */
+    /* =====================================================
+       COMMAND LOOP
+       ===================================================== */
 
     while (1)
     {
-        memset(buffer, 0, sizeof(buffer));
+        line_length =
+            recv_line(client_fd,
+                      buffer,
+                      sizeof(buffer));
 
-        bytes_received =
-            recv(client_fd,
-                 buffer,
-                 sizeof(buffer) - 1,
-                 0);
-
-        if (bytes_received <= 0)
+        if (line_length <= 0)
         {
             printf("Controller disconnected.\n");
             break;
         }
 
-        buffer[bytes_received] = '\0';
-        buffer[strcspn(buffer, "\r\n")] = '\0';
-
-        printf("Received command: %s\n", buffer);
+        printf("Received command: %s\n",
+               buffer);
 
         /* SYSINFO */
         if (strcmp(buffer, "SYSINFO") == 0)
@@ -320,45 +564,73 @@ int main(void)
         }
 
         /* LISTPROC */
-        else if (strcmp(buffer, "LISTPROC") == 0)
+        else if (strcmp(buffer,
+                        "LISTPROC") == 0)
         {
             send_listproc(client_fd);
         }
 
         /* EXEC */
-        else if (strncmp(buffer, "EXEC ", 5) == 0)
+        else if (strncmp(buffer,
+                         "EXEC ",
+                         5) == 0)
         {
-            const char *exec_name = buffer + 5;
+            execute_whitelist_command(
+                client_fd,
+                buffer + 5);
+        }
 
-            execute_whitelist_command(client_fd,
-                                      exec_name);
+        /* PUT <filename> <size> */
+        else if (strncmp(buffer,
+                         "PUT ",
+                         4) == 0)
+        {
+            char filename[256];
+            unsigned long long file_size;
+            char extra;
+
+            /*
+             * %c detects unexpected extra arguments.
+             */
+            int parsed =
+                sscanf(buffer,
+                       "PUT %255s %llu %c",
+                       filename,
+                       &file_size,
+                       &extra);
+
+            if (parsed != 2)
+            {
+                send_text(client_fd,
+                          "ERR 009 BAD_PUT_FORMAT SID:"
+                          SID "\n");
+
+                continue;
+            }
+
+            handle_put(client_fd,
+                       filename,
+                       file_size);
         }
 
         /* QUIT */
         else if (strcmp(buffer, "QUIT") == 0)
         {
-            const char *response =
-                "OK BYE SID:" SID "\n";
-
-            send(client_fd,
-                 response,
-                 strlen(response),
-                 0);
+            send_text(client_fd,
+                      "OK BYE SID:"
+                      SID "\n");
 
             printf("Controller requested disconnect.\n");
+
             break;
         }
 
         /* Unknown command */
         else
         {
-            const char *response =
-                "ERR 002 UNKNOWN_COMMAND SID:" SID "\n";
-
-            send(client_fd,
-                 response,
-                 strlen(response),
-                 0);
+            send_text(client_fd,
+                      "ERR 002 UNKNOWN_COMMAND SID:"
+                      SID "\n");
         }
     }
 

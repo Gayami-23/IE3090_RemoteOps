@@ -4,24 +4,348 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 9410
 #define BUFFER_SIZE 4096
+#define SID "2651"
+
+/* =========================================================
+   TCP HELPER FUNCTIONS
+   ========================================================= */
+
+int send_all(int socket_fd,
+             const void *data,
+             size_t length)
+{
+    const char *buffer =
+        (const char *)data;
+
+    size_t total_sent = 0;
+
+    while (total_sent < length)
+    {
+        ssize_t sent =
+            send(socket_fd,
+                 buffer + total_sent,
+                 length - total_sent,
+                 0);
+
+        if (sent <= 0)
+        {
+            return -1;
+        }
+
+        total_sent += (size_t)sent;
+    }
+
+    return 0;
+}
+
+ssize_t recv_line(int socket_fd,
+                  char *buffer,
+                  size_t buffer_size)
+{
+    size_t position = 0;
+
+    if (buffer_size == 0)
+    {
+        return -1;
+    }
+
+    while (position < buffer_size - 1)
+    {
+        char ch;
+
+        ssize_t received =
+            recv(socket_fd,
+                 &ch,
+                 1,
+                 0);
+
+        if (received == 0)
+        {
+            if (position == 0)
+            {
+                return 0;
+            }
+
+            break;
+        }
+
+        if (received < 0)
+        {
+            return -1;
+        }
+
+        if (ch == '\n')
+        {
+            break;
+        }
+
+        if (ch != '\r')
+        {
+            buffer[position++] = ch;
+        }
+    }
+
+    buffer[position] = '\0';
+
+    return (ssize_t)position;
+}
+
+/* Send a local file exactly */
+int send_file_bytes(int socket_fd,
+                    FILE *file,
+                    unsigned long long file_size)
+{
+    char buffer[BUFFER_SIZE];
+
+    unsigned long long remaining =
+        file_size;
+
+    while (remaining > 0)
+    {
+        size_t amount_to_read;
+
+        if (remaining > sizeof(buffer))
+        {
+            amount_to_read =
+                sizeof(buffer);
+        }
+        else
+        {
+            amount_to_read =
+                (size_t)remaining;
+        }
+
+        size_t bytes_read =
+            fread(buffer,
+                  1,
+                  amount_to_read,
+                  file);
+
+        if (bytes_read == 0)
+        {
+            return -1;
+        }
+
+        if (send_all(socket_fd,
+                     buffer,
+                     bytes_read) < 0)
+        {
+            return -1;
+        }
+
+        remaining -=
+            (unsigned long long)bytes_read;
+    }
+
+    return 0;
+}
+
+/* =========================================================
+   RECEIVE MULTI-LINE RESPONSE
+   ========================================================= */
+
+int receive_until_marker(int socket_fd,
+                         const char *success_marker)
+{
+    char line[BUFFER_SIZE];
+
+    while (1)
+    {
+        ssize_t length =
+            recv_line(socket_fd,
+                      line,
+                      sizeof(line));
+
+        if (length <= 0)
+        {
+            printf("Agent closed the connection.\n");
+            return -1;
+        }
+
+        printf("%s\n", line);
+
+        if (strstr(line,
+                   success_marker) != NULL)
+        {
+            return 0;
+        }
+
+        if (strncmp(line,
+                    "ERR ",
+                    4) == 0)
+        {
+            return -1;
+        }
+    }
+}
+
+/* =========================================================
+   PUT
+   ========================================================= */
+
+void handle_put(int socket_fd,
+                const char *command)
+{
+    char filename[256];
+    char filepath[512];
+    char protocol_command[1024];
+    char response[BUFFER_SIZE];
+
+    /*
+     * Controller syntax:
+     * PUT <local-file>
+     *
+     * Example:
+     * PUT test.txt
+     */
+    if (sscanf(command,
+               "PUT %255s",
+               filename) != 1)
+    {
+        printf("Usage: PUT <filename>\n");
+        return;
+    }
+
+    /*
+     * For this stage the local file is expected
+     * in the current project directory.
+     */
+    snprintf(filepath,
+             sizeof(filepath),
+             "%s",
+             filename);
+
+    FILE *file =
+        fopen(filepath, "rb");
+
+    if (file == NULL)
+    {
+        printf("Local file not found: %s\n",
+               filepath);
+        return;
+    }
+
+    /* Determine exact file size */
+    if (fseek(file, 0, SEEK_END) != 0)
+    {
+        printf("Unable to determine file size.\n");
+        fclose(file);
+        return;
+    }
+
+    long size = ftell(file);
+
+    if (size < 0)
+    {
+        printf("Unable to determine file size.\n");
+        fclose(file);
+        return;
+    }
+
+    rewind(file);
+
+    unsigned long long file_size =
+        (unsigned long long)size;
+
+    /*
+     * Protocol sent to Agent:
+     * PUT <filename> <size>\n
+     */
+    snprintf(protocol_command,
+             sizeof(protocol_command),
+             "PUT %s %llu\n",
+             filename,
+             file_size);
+
+    if (send_all(socket_fd,
+                 protocol_command,
+                 strlen(protocol_command)) < 0)
+    {
+        printf("Failed to send PUT command.\n");
+        fclose(file);
+        return;
+    }
+
+    /* Wait for Agent READY response */
+    ssize_t length =
+        recv_line(socket_fd,
+                  response,
+                  sizeof(response));
+
+    if (length <= 0)
+    {
+        printf("Agent closed the connection.\n");
+        fclose(file);
+        return;
+    }
+
+    printf("%s\n", response);
+
+    if (strcmp(response,
+               "OK READY SID:" SID) != 0)
+    {
+        printf("Agent did not accept the upload.\n");
+        fclose(file);
+        return;
+    }
+
+    /* Send exactly file_size bytes */
+    if (send_file_bytes(socket_fd,
+                        file,
+                        file_size) < 0)
+    {
+        printf("File upload failed.\n");
+        fclose(file);
+        return;
+    }
+
+    fclose(file);
+
+    /* Receive final PUT response */
+    length =
+        recv_line(socket_fd,
+                  response,
+                  sizeof(response));
+
+    if (length <= 0)
+    {
+        printf("Agent closed the connection.\n");
+        return;
+    }
+
+    printf("%s\n", response);
+
+    if (strcmp(response,
+               "OK PUT SID:" SID) == 0)
+    {
+        printf("Upload completed: %s (%llu bytes)\n",
+               filename,
+               file_size);
+    }
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
 
 int main(void)
 {
     int sock_fd;
+
     struct sockaddr_in server_addr;
 
     char token[100];
-    char command[200];
+    char command[512];
     char buffer[BUFFER_SIZE];
 
-    ssize_t bytes_received;
-
     /* Create TCP socket */
-    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    sock_fd =
+        socket(AF_INET, SOCK_STREAM, 0);
 
     if (sock_fd < 0)
     {
@@ -31,8 +355,9 @@ int main(void)
 
     printf("RemoteOps Controller - IT24101562\n");
 
-    /* Configure Agent address */
-    memset(&server_addr, 0, sizeof(server_addr));
+    memset(&server_addr,
+           0,
+           sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
@@ -47,9 +372,9 @@ int main(void)
     }
 
     printf("Connecting to Agent at %s:%d...\n",
-           SERVER_IP, PORT);
+           SERVER_IP,
+           PORT);
 
-    /* Connect to Agent */
     if (connect(sock_fd,
                 (struct sockaddr *)&server_addr,
                 sizeof(server_addr)) < 0)
@@ -61,74 +386,68 @@ int main(void)
 
     printf("Connected to RemoteOps Agent.\n");
 
-    /* ===================================== */
-    /* AUTHENTICATION                        */
-    /* ===================================== */
+    /* =====================================================
+       AUTHENTICATION
+       ===================================================== */
 
     printf("Enter authentication token: ");
 
     if (scanf("%99s", token) != 1)
     {
-        printf("Failed to read authentication token.\n");
         close(sock_fd);
         return 1;
     }
 
-    snprintf(command,
-             sizeof(command),
+    snprintf(buffer,
+             sizeof(buffer),
              "AUTH %s\n",
              token);
 
-    if (send(sock_fd,
-             command,
-             strlen(command),
-             0) < 0)
+    if (send_all(sock_fd,
+                 buffer,
+                 strlen(buffer)) < 0)
     {
-        perror("send");
+        printf("Failed to send authentication.\n");
         close(sock_fd);
         return 1;
     }
 
-    memset(buffer, 0, sizeof(buffer));
+    ssize_t length =
+        recv_line(sock_fd,
+                  buffer,
+                  sizeof(buffer));
 
-    bytes_received =
-        recv(sock_fd,
-             buffer,
-             sizeof(buffer) - 1,
-             0);
-
-    if (bytes_received <= 0)
+    if (length <= 0)
     {
         printf("Agent closed the connection.\n");
         close(sock_fd);
         return 1;
     }
 
-    buffer[bytes_received] = '\0';
+    printf("Agent response: %s\n", buffer);
 
-    printf("Agent response: %s", buffer);
-
-    if (strstr(buffer, "OK AUTHENTICATED") == NULL)
+    if (strcmp(buffer,
+               "OK AUTHENTICATED SID:" SID) != 0)
     {
-        printf("Authentication failed. Closing connection.\n");
+        printf("Authentication failed.\n");
         close(sock_fd);
         return 1;
     }
 
     /*
-     * Remove the newline left by scanf so that
-     * fgets() can be used for commands containing spaces.
+     * Remove newline remaining after scanf.
      */
     int ch;
 
-    while ((ch = getchar()) != '\n' && ch != EOF)
+    while ((ch = getchar()) != '\n' &&
+           ch != EOF)
     {
-        /* discard remaining input */
+        /* discard */
     }
 
-    /* ===================================== */
-    /* COMMAND LOOP                          */
-    /* ===================================== */
+    /* =====================================================
+       COMMAND LOOP
+       ===================================================== */
 
     while (1)
     {
@@ -140,6 +459,7 @@ int main(void)
         printf("  EXEC DISKFREE\n");
         printf("  EXEC HOSTNAME\n");
         printf("  EXEC WHOAMI\n");
+        printf("  PUT <filename>\n");
         printf("  QUIT\n");
 
         printf("\nEnter command: ");
@@ -151,92 +471,99 @@ int main(void)
             break;
         }
 
-        /* Remove newline from keyboard input */
-        command[strcspn(command, "\r\n")] = '\0';
+        command[strcspn(command,
+                       "\r\n")] = '\0';
 
         if (strlen(command) == 0)
         {
             continue;
         }
 
-        /* Add protocol newline */
-        char send_buffer[250];
+        /* ---------------- PUT ---------------- */
 
-        snprintf(send_buffer,
-                 sizeof(send_buffer),
+        if (strncmp(command,
+                    "PUT ",
+                    4) == 0)
+        {
+            handle_put(sock_fd,
+                       command);
+
+            continue;
+        }
+
+        /* Send ordinary command */
+        snprintf(buffer,
+                 sizeof(buffer),
                  "%s\n",
                  command);
 
-        if (send(sock_fd,
-                 send_buffer,
-                 strlen(send_buffer),
-                 0) < 0)
+        if (send_all(sock_fd,
+                     buffer,
+                     strlen(buffer)) < 0)
         {
-            perror("send");
+            printf("Failed to send command.\n");
             break;
         }
 
-        /*
-         * LISTPROC and EXEC may return multiple
-         * TCP receive blocks.
-         */
-        if (strcmp(command, "LISTPROC") == 0 ||
-            strncmp(command, "EXEC ", 5) == 0)
+        /* ---------------- LISTPROC ---------------- */
+
+        if (strcmp(command,
+                   "LISTPROC") == 0)
         {
-            while (1)
-            {
-                memset(buffer, 0, sizeof(buffer));
-
-                bytes_received =
-                    recv(sock_fd,
-                         buffer,
-                         sizeof(buffer) - 1,
-                         0);
-
-                if (bytes_received <= 0)
-                {
-                    printf("Agent closed the connection.\n");
-                    break;
-                }
-
-                buffer[bytes_received] = '\0';
-
-                printf("%s", buffer);
-
-                /*
-                 * Successful LISTPROC / EXEC or
-                 * an ERR response finishes command.
-                 */
-                if (strstr(buffer,
-                           "OK LISTPROC SID:2651") != NULL ||
-                    strstr(buffer,
-                           "OK EXEC SID:2651") != NULL ||
-                    strstr(buffer,
-                           "ERR ") != NULL)
-                {
-                    break;
-                }
-            }
+            receive_until_marker(
+                sock_fd,
+                "OK LISTPROC SID:" SID);
         }
+
+        /* ---------------- EXEC ---------------- */
+
+        else if (strncmp(command,
+                         "EXEC ",
+                         5) == 0)
+        {
+            receive_until_marker(
+                sock_fd,
+                "OK EXEC SID:" SID);
+        }
+
+        /* ---------------- OTHER ---------------- */
+
         else
         {
-            memset(buffer, 0, sizeof(buffer));
+            length =
+                recv_line(sock_fd,
+                          buffer,
+                          sizeof(buffer));
 
-            bytes_received =
-                recv(sock_fd,
-                     buffer,
-                     sizeof(buffer) - 1,
-                     0);
-
-            if (bytes_received <= 0)
+            if (length <= 0)
             {
                 printf("Agent closed the connection.\n");
                 break;
             }
 
-            buffer[bytes_received] = '\0';
+            /*
+             * SYSINFO contains multiple lines.
+             * First line has already been received,
+             * so continue until OK SYSINFO.
+             */
+            if (strcmp(command,
+                       "SYSINFO") == 0)
+            {
+                printf("%s\n", buffer);
 
-            printf("\nAgent response:\n%s", buffer);
+                if (strstr(buffer,
+                           "OK SYSINFO SID:" SID) == NULL)
+                {
+                    receive_until_marker(
+                        sock_fd,
+                        "OK SYSINFO SID:" SID);
+                }
+            }
+            else
+            {
+                printf("Agent response: %s\n",
+                       buffer);
+            }
         }
 
         if (strcmp(command, "QUIT") == 0)
